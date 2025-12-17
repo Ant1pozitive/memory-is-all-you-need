@@ -15,6 +15,7 @@ class ModelConfig:
     vocab_size: int = 12
     embed_dim: int = 32
     hidden_dim: int = 128
+    controller_type: str = "gru"  # "gru" or "transformer"
 
 @dataclass
 class TaskConfig:
@@ -31,8 +32,10 @@ class TrainConfig:
     lambda_sparsity: float = 0.01
     lambda_diversity: float = 0.005
     lambda_usage: float = 0.001
+    lambda_priority: float = 0.001  # for learned policy
     patience: int = 5  # early stopping
     use_wandb: bool = False
+    mixed_precision: bool = True
 
 @dataclass
 class BaseConfig:
