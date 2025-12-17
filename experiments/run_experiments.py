@@ -1,10 +1,7 @@
-"""
-Small runner to launch experiments with different configs.
-"""
 import argparse
 import os
 from config import cfg
-from train import run_copy_experiment
+from train import run_experiment
 
 def make_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -12,9 +9,9 @@ def make_dir(path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp', type=str, default='default')
+    parser.add_argument('--task', type=str, default='copy')
     args = parser.parse_args()
 
     exp_root = os.path.join('experiments', args.exp)
     make_dir(exp_root)
-    # default: copy experiment
-    run_copy_experiment(exp_root)
+    run_experiment(args.task, exp_root)
