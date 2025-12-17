@@ -2,35 +2,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.decomposition import PCA
 
-def plot_attention_dynamics(weights, out_path: str, title: str, head: int = 0):
-    arr = np.array(weights)
-    if arr.ndim == 4:
+def plot_attention_dynamics(weights: np.ndarray, out_path: str, title: str = "Attention Dynamics"):
+    arr = weights
+    if arr.ndim == 4:  # (B, T, H, N)
         arr = arr[0]
     T, H, N = arr.shape
     canvas = arr.transpose(2, 0, 1).reshape(N, T * H)
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(15, 8))
     plt.imshow(canvas, aspect='auto', cmap='viridis')
-    plt.xlabel('time x head')
-    plt.ylabel('memory slot')
+    plt.xlabel('Time × Head')
+    plt.ylabel('Memory Slot')
     plt.title(title)
     plt.colorbar()
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
 
-def plot_slot_dynamics(read_weights, write_weights, memory_hist, out_path: str):
-    plot_attention_dynamics(read_weights, out_path.replace('.png', '_read.png'), 'Read attention dynamics')
-    plot_attention_dynamics(write_weights, out_path.replace('.png', '_write.png'), 'Write attention dynamics')
-    # PCA on slots over time
-    memory_np = np.array(memory_hist)  # (T, B, N, D) -> take [0]
-    if memory_np.ndim == 4:
-        memory_np = memory_np[:, 0]  # (T, N, D)
+def plot_slot_pca(memory_hist: np.ndarray, out_path: str):
+    # memory_hist: (T, B, N, D) -> take first batch
+    mem = memory_hist[:, 0]  # (T, N, D)
     pca = PCA(n_components=2)
-    proj = pca.fit_transform(memory_np.reshape(-1, memory_np.shape[-1])).reshape(memory_np.shape[0], memory_np.shape[1], 2)
-    plt.figure(figsize=(12, 6))
-    for slot in range(proj.shape[1]):
-        plt.plot(proj[:, slot, 0], proj[:, slot, 1], label=f'Slot {slot}')
-    plt.title('Slot contents PCA trajectory')
-    plt.legend()
-    plt.savefig(out_path.replace('.png', '_slots_pca.png'))
+    traj = pca.fit_transform(mem.reshape(-1, mem.shape[-1])).reshape(mem.shape[0], mem.shape[1], 2)
+
+    plt.figure(figsize=(10, 8))
+    for slot in range(traj.shape[1]):
+        plt.plot(traj[:, slot, 0], traj[:, slot, 1], label=f"Slot {slot}", alpha=0.7)
+    plt.title("Memory Slot Trajectories (PCA)")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(out_path)
     plt.close()
