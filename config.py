@@ -7,23 +7,24 @@ class MemoryConfig:
     dim: int = 128
     heads: int = 8
     topk: int = 16
-    policy: str = "topk"
-    decay_rate: float = 0.99  # base decay
+    policy: str = "topk"  # "topk", "lru", "learned"
+    decay_rate: float = 0.99
     use_decay_gate: bool = True
 
 @dataclass
 class ModelConfig:
     vocab_size: int = 20
     embed_dim: int = 128
-    hidden_dim: int = 256
+    hidden_dim: int = 512
     num_layers: int = 4
+    num_heads_attn: int = 8
     controller_type: str = "transformer"  # "transformer" or "gru"
 
 @dataclass
 class TaskConfig:
     seq_len: int = 10
-    max_delay: int = 100
-    num_continual_tasks: int = 5  # for continual
+    delay_len: int = 100
+    num_continual_tasks: int = 5
 
 @dataclass
 class TrainConfig:
@@ -34,7 +35,8 @@ class TrainConfig:
     lambda_sparsity: float = 0.02
     lambda_diversity: float = 0.01
     lambda_forgetting: float = 0.005
-    use_wandb: bool = True
+    patience: int = 10
+    use_wandb: bool = False
     mixed_precision: bool = True
 
 @dataclass
