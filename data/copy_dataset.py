@@ -4,13 +4,13 @@ import torch
 
 class CopyDataset(TaskDataset):
     """Copy-with-delay dataset. Infinite generation."""
-    def __init__(self, vocab_size, seq_len, delay_len, size=None):
-        super().__init__(vocab_size, size)
+    def __init__(self, vocab_size, seq_len, delay_len):
+        super().__init__(vocab_size)
         self.seq_len = seq_len
         self.delay_len = delay_len
         self.delim = vocab_size - 1
 
-    def __getitem__(self, idx):
+    def __next__(self):
         seq = np.random.randint(0, self.vocab_size - 1, size=(self.seq_len,))
         input_seq = np.concatenate([
             seq,
