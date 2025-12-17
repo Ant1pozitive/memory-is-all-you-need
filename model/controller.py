@@ -3,13 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TransformerController(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, mem_dim: int, n_heads: int, num_layers: int, num_heads_attn: int):
+    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, mem_dim: int,
+                 n_heads: int, num_layers: int, num_heads_attn: int, max_seq_len: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_emb = nn.Parameter(torch.randn(1, 1024, embed_dim))
+        self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))  # +1 for memory token
         self.mem_proj = nn.Linear(mem_dim, embed_dim)
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads_attn, dim_feedforward=hidden_dim, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads_attn, dim_feedforward=hidden_dim,
+            batch_first=True, activation="gelu"
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         self.to_read_key = nn.Linear(embed_dim, n_heads * mem_dim)
@@ -21,10 +25,11 @@ class TransformerController(nn.Module):
 
         self.beta_read = nn.Parameter(torch.ones(n_heads))
         self.beta_write = nn.Parameter(torch.ones(n_heads))
+
         self.n_heads = n_heads
         self.mem_dim = mem_dim
 
-    def forward(self, input_seq: torch.Tensor, read_vec: torch.Tensor):
+    def forward(self, input_seq: torch.Tensor, read_vec: torch.Tensor, current_t: int):
         B, T = input_seq.shape
         emb = self.embed(input_seq)  # (B, T, E)
         pos = self.pos_emb[:, :T, :].to(emb.device)
@@ -34,7 +39,7 @@ class TransformerController(nn.Module):
         seq_with_mem = torch.cat([emb, mem_token], dim=1)  # (B, T+1, E)
 
         out = self.transformer(seq_with_mem)  # (B, T+1, E)
-        controller_state = out[:, -1]  # use memory token output
+        controller_state = out[:, -1]  # last token is memory-augmented
 
         read_key = self.to_read_key(controller_state).view(B, self.n_heads, self.mem_dim)
         write_key = self.to_write_key(controller_state).view(B, self.n_heads, self.mem_dim)
