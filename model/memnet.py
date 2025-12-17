@@ -11,7 +11,7 @@ class MemNet(nn.Module):
         self.cfg = cfg
         self.memory = MultiHeadMemoryBank(
             cfg.memory.slots, cfg.memory.dim, cfg.memory.heads, cfg.memory.topk,
-            cfg.memory.policy, cfg.memory.use_decay_gate
+            cfg.memory.policy, cfg.memory.use_decay_gate, cfg.memory.decay_rate
         )
         self.controller = TransformerController(
             cfg.model.vocab_size, cfg.model.embed_dim, cfg.model.hidden_dim,
