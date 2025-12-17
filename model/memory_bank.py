@@ -16,7 +16,7 @@ def topk_sparse_softmax(sim: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.
     return weights, mask
 
 class MultiHeadMemoryBank(nn.Module):
-    def __init__(self, num_slots: int, slot_dim: int, n_heads: int = 4, topk: int = 8, policy: str = "topk"):
+    def __init__(self, num_slots: int, slot_dim: int, n_heads: int = 4, topk: int = 8, policy: str = "topk", use_decay_gate: bool = True):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -30,13 +30,23 @@ class MultiHeadMemoryBank(nn.Module):
             self.priority_mlp = nn.Linear(slot_dim, 1)
         if policy == "lru":
             self.access_times = None
+        self.use_decay_gate = use_decay_gate
+        if use_decay_gate:
+            self.decay_gate = nn.Parameter(torch.ones(num_slots) * 0.99)
 
     def reset_memory(self, batch_size: int, device):
         mem = self.init_memory.expand(batch_size, -1, -1).contiguous().to(device)
         if self.policy == "lru":
             self.access_times = torch.zeros(batch_size, self.num_slots, dtype=torch.float32, device=device)
         return mem
-
+    def apply_decay(self, memory):
+        if self.use_decay_gate:
+            decay = torch.sigmoid(self.decay_gate).unsqueeze(0).unsqueeze(-1)
+            memory = memory * decay
+        else:
+            memory = memory * cfg.memory.decay_rate
+        return memory
+        
     @staticmethod
     def cosine_sim(keys: torch.Tensor, memory: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         k_norm = keys.norm(p=2, dim=-1, keepdim=True).clamp_min(eps)
@@ -77,4 +87,5 @@ class MultiHeadMemoryBank(nn.Module):
         mem_after_add = mem_after_erase + w_unsq * add_unsq
         new_memory = mem_after_add.mean(dim=1)
         new_memory = F.normalize(new_memory + 1e-8, dim=-1)
+        new_memory = self.apply_decay(new_memory)
         return new_memory, weights
