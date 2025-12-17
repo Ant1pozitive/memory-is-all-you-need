@@ -3,38 +3,38 @@ import torch
 
 @dataclass
 class MemoryConfig:
-    slots: int = 64
-    dim: int = 64
-    heads: int = 4
-    topk: int = 8
-    policy: str = "topk"  # "topk", "lru", "learned"
-    lru_capacity: int = 64  # for lru
+    slots: int = 128
+    dim: int = 128
+    heads: int = 8
+    topk: int = 16
+    policy: str = "topk"
+    decay_rate: float = 0.99  # base decay
+    use_decay_gate: bool = True
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 12
-    embed_dim: int = 32
-    hidden_dim: int = 128
-    controller_type: str = "gru"  # "gru" or "transformer"
+    vocab_size: int = 20
+    embed_dim: int = 128
+    hidden_dim: int = 256
+    num_layers: int = 4
+    controller_type: str = "transformer"  # "transformer" or "gru"
 
 @dataclass
 class TaskConfig:
-    seq_len: int = 6
-    delay_len: int = 40
-    assoc_pairs: int = 5  # for associative recall
+    seq_len: int = 10
+    max_delay: int = 100
+    num_continual_tasks: int = 5  # for continual
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 64
-    lr: float = 3e-4
-    epochs: int = 30
+    batch_size: int = 32
+    lr: float = 1e-4
+    epochs: int = 50
     grad_clip: float = 1.0
-    lambda_sparsity: float = 0.01
-    lambda_diversity: float = 0.005
-    lambda_usage: float = 0.001
-    lambda_priority: float = 0.001  # for learned policy
-    patience: int = 5  # early stopping
-    use_wandb: bool = False
+    lambda_sparsity: float = 0.02
+    lambda_diversity: float = 0.01
+    lambda_forgetting: float = 0.005
+    use_wandb: bool = True
     mixed_precision: bool = True
 
 @dataclass
