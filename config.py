@@ -18,13 +18,12 @@ class ModelConfig:
     hidden_dim: int = 512
     num_layers: int = 4
     num_heads_attn: int = 8
-    controller_type: str = "transformer"  # "transformer" or "gru"
+    max_seq_len: int = 512
 
 @dataclass
 class TaskConfig:
     seq_len: int = 10
     delay_len: int = 100
-    num_continual_tasks: int = 5
 
 @dataclass
 class TrainConfig:
