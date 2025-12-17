@@ -1,5 +1,6 @@
-torch
+torch>=2.0.0
 numpy
 matplotlib
-wandb  # optional for logging
-pytest
+scikit-learn
+tqdm
+wandb  # optional, for logging
