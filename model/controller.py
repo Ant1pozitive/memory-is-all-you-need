@@ -41,11 +41,20 @@ class GRUController(BaseController):
 class TransformerController(BaseController):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        embed_dim, mem_dim, hidden_dim = args[1], args[3], args[2]
-        self.transformer = nn.TransformerEncoderLayer(d_model=embed_dim + mem_dim, nhead=4, dim_feedforward=hidden_dim)
+        embed_dim = args[1]
+        self.pos_emb = nn.Parameter(torch.randn(1, 512, embed_dim))  # max seq
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=embed_dim * 2, nhead=8, dim_feedforward=512),
+            num_layers=cfg.model.num_layers
+        )
 
-    def forward(self, x_t, h, read_vec):
-        emb = self.embed(x_t).unsqueeze(0)  # seq dim
-        inp = torch.cat([emb, read_vec.unsqueeze(0)], dim=-1)
-        h_new = self.transformer(inp).squeeze(0)
-        return self._common_forward(h_new, read_vec)
+    def forward(self, input_seq, read_vec):
+        # input_seq: (B, T), read_vec: (B, D)
+        emb = self.embed(input_seq)  # (B, T, D)
+        read_token = read_vec.unsqueeze(1)  # (B, 1, D)
+        inp = torch.cat([emb, read_token], dim=1)  # prepend or append memory token
+        pos = self.pos_emb[:, :inp.shape[1]]
+        inp = inp + pos
+        out = self.transformer(inp.transpose(0,1)).transpose(0,1)  # (B, T+1, D)
+        controller_out = out[:, -1]  # last token or mean
+        return self._common_forward(controller_out, read_vec)
