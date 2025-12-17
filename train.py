@@ -1,155 +1,231 @@
 import argparse
 import os
 from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import wandb
-import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 
 from config import cfg
 from data.copy_dataset import CopyDataset
-from data.associative_recall import AssociativeRecallDataset
-from data.omniglot_dataset import OmniglotDataset
 from model.memnet import MemNet
-from utils.visualize import plot_slot_dynamics
+from utils.visualize import plot_attention_dynamics, plot_slot_dynamics
 
-def get_dataset(task):
+if cfg.train.use_wandb:
+    import wandb
+    wandb.init(project="memory-is-all-you-need", config=cfg.__dict__)
+
+device = torch.device(cfg.device)
+torch.manual_seed(cfg.seed)
+np.random.seed(cfg.seed)
+
+
+def get_dataset(task: str):
     if task == "copy":
-        return CopyDataset(cfg.model.vocab_size, cfg.task.seq_len, cfg.task.delay_len)
-    elif task == "assoc":
-        return AssociativeRecallDataset(cfg.model.vocab_size, cfg.task.assoc_pairs, cfg.task.delay_len)
-    elif task == "omniglot":
-        return OmniglotDataset(cfg.model.vocab_size)
-    raise ValueError("Unknown task")
+        return CopyDataset(cfg.model.vocab_size, cfg.task.seq_len, cfg.task.delay_len, size=10000)
+    # Add more tasks here later (continual, assoc, etc.)
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
-def sparsity_loss(weights):
-    return -torch.mean(weights * torch.log(weights + 1e-6))
 
-def diversity_loss(memory):
-    sim = torch.einsum('bnd,bmd->bnm', memory, memory)
-    return torch.mean(sim.triu(1))
+def sparsity_loss(weights: torch.Tensor) -> torch.Tensor:
+    """Negative entropy to encourage sparsity"""
+    eps = 1e-6
+    return -torch.mean(weights * torch.log(weights + eps))
 
-def usage_loss(weights):
-    return -torch.mean(torch.sum(weights, dim=-1))
 
-def priority_loss(priorities):
-    return -torch.mean(priorities * torch.log(priorities + 1e-6))
+def diversity_loss(memory: torch.Tensor) -> torch.Tensor:
+    """Encourage diverse slot contents (upper triangular cosine similarity)"""
+    norm_mem = F.normalize(memory, dim=-1)
+    sim = torch.bmm(norm_mem, norm_mem.transpose(1, 2))  # (B, N, N)
+    return torch.mean(torch.triu(sim, diagonal=1))
 
-def train_epoch(model, loader, opt, scaler, device, cfg, epoch):
-    model.train()
-    ce = nn.CrossEntropyLoss(ignore_index=-100)
-    total_loss = 0.0
-    total_aux = 0.0
-    for inputs, targets in tqdm(loader):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        with autocast(enabled=cfg.train.mixed_precision):
-            logits, read_w, write_w, memory_hist = model.forward_sequence(inputs, return_attn=True)
-            B, T, V = logits.shape
-            ce_loss = ce(logits.view(B * T, V), targets.view(B * T))
-            spar_loss = sparsity_loss(read_w.mean(1)) + sparsity_loss(write_w.mean(1))
-            div_loss = diversity_loss(memory_hist[-1].to(device))
-            use_loss = usage_loss(read_w.mean(1)) + usage_loss(write_w.mean(1))
-            pri_loss = 0
-            if model.memory.policy == "learned":
-                priorities = model.memory.priority_mlp(memory_hist[-1].to(device)).squeeze(-1)
-                pri_loss = priority_loss(F.softmax(priorities, dim=-1))
-            aux_loss = cfg.train.lambda_sparsity * spar_loss + cfg.train.lambda_diversity * div_loss + cfg.train.lambda_usage * use_loss + cfg.train.lambda_priority * pri_loss
-            loss = ce_loss + aux_loss
-        opt.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-        scaler.step(opt)
-        scaler.update()
-        total_loss += ce_loss.item() * inputs.size(0)
-        total_aux += aux_loss.item() * inputs.size(0)
-    if cfg.train.use_wandb:
-        wandb.log({"train_loss": total_loss / len(loader.dataset), "aux_loss": total_aux / len(loader.dataset), "epoch": epoch})
-    return total_loss / len(loader.dataset)
+
+def forgetting_loss(memory: torch.Tensor) -> torch.Tensor:
+    """Memory pressure: penalize high norms on all slots → encourage forgetting unused"""
+    norms = memory.norm(dim=-1).mean(dim=1)
+    return norms.mean()
+
 
 @torch.no_grad()
-def evaluate(model, loader, device, cfg):
-    model.eval()
-    ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+def compute_metrics(logits: torch.Tensor, targets: torch.Tensor, read_weights: torch.Tensor, memory: torch.Tensor):
+    preds = logits.argmax(dim=-1)
+    mask = targets != -100
+
+    correct = (preds[mask] == targets[mask]).sum().item()
+    total = mask.sum().item()
+    acc = correct / total if total > 0 else 0.0
+    output_positions = torch.cumsum(mask.float(), dim=1) - 1  # 0 to seq_len-1
+    pos_correct = torch.zeros(cfg.task.seq_len, device=device)
+    pos_count = torch.zeros(cfg.task.seq_len, device=device)
+    for p in range(cfg.task.seq_len):
+        p_mask = (output_positions == p) & mask
+        pos_correct[p] = (preds[p_mask] == targets[p_mask]).sum()
+        pos_count[p] = p_mask.sum()
+
+    pos_acc = (pos_correct / (pos_count + 1e-8)).cpu().numpy()
+    slot_norms = memory.norm(dim=-1).mean(dim=0)
+    utilization = (slot_norms > 0.1).float().mean().item()
+    read_sparsity = (read_weights > 0.01).float().mean().item()
+
+    return acc, pos_acc, utilization, read_sparsity
+
+
+def train_epoch(model: MemNet, loader: DataLoader, optimizer: torch.optim.Optimizer,
+                scaler: GradScaler, epoch: int):
+    model.train()
+    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     total_loss = 0.0
-    total_correct = 0
-    total_out = 0
-    pos_correct = np.zeros(cfg.task.seq_len)
-    pos_count = np.zeros(cfg.task.seq_len)
-    slot_util = 0.0
-    for inputs, targets in loader:
+    total_ce = 0.0
+    total_aux = 0.0
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
+    for inputs, targets in pbar:
         inputs = inputs.to(device)
         targets = targets.to(device)
+
         with autocast(enabled=cfg.train.mixed_precision):
-            logits, read_w, write_w, memory_hist = model.forward_sequence(inputs, return_attn=True)
-        B, T, V = logits.shape
-        preds = logits.argmax(-1)
-        mask = targets != -100
-        out_pos = torch.cumsum(mask.float(), dim=1) - 1
-        for p in range(cfg.task.seq_len):
-            p_mask = (out_pos == p) & mask
-            pos_correct[p] += (preds[p_mask] == targets[p_mask]).sum().item()
-            pos_count[p] += p_mask.sum().item()
-        total_out += mask.sum().item()
-        total_correct += (preds[mask] == targets[mask]).sum().item()
-        total_loss += ce(logits.view(B * T, V), targets.view(B * T)).item()
-        slot_util += memory_hist[-1].norm(dim=-1).mean().item()
-    acc = total_correct / (total_out + 1e-12)
-    pos_acc = pos_correct / (pos_count + 1e-12)
-    slot_util /= len(loader)
-    if cfg.train.use_wandb:
-        wandb.log({"val_acc": acc, "val_loss": total_loss / len(loader.dataset), "slot_util": slot_util, "pos_acc": wandb.plot.line(np.arange(len(pos_acc)), pos_acc, title="Positional Acc")})
-    return total_loss / len(loader.dataset), acc, pos_acc
+            logits, read_w, write_w = model(inputs, return_attn=True)
+            ce_loss = ce_loss_fn(logits.view(-1, cfg.model.vocab_size), targets.view(-1))
+            last_memory = model.memory.init_memory.expand(inputs.size(0), -1, -1).to(device)
+            spar_loss = sparsity_loss(read_w.mean(dim=1)) + sparsity_loss(write_w.mean(dim=1))
+            div_loss = diversity_loss(last_memory)
+            forg_loss = forgetting_loss(last_memory)
 
-def run_experiment(task: str, save_dir: str):
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    device = cfg.device
-    os.makedirs(save_dir, exist_ok=True)
-    if cfg.train.use_wandb:
-        wandb.init(project="memory-net", config=cfg.__dict__)
+            aux_loss = (cfg.train.lambda_sparsity * spar_loss +
+                        cfg.train.lambda_diversity * div_loss +
+                        cfg.train.lambda_forgetting * forg_loss)
 
-    train_ds = get_dataset(task)
-    val_ds = get_dataset(task)
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, num_workers=0, pin_memory=True, prefetch_factor=2)
-    val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size, num_workers=0, pin_memory=True, prefetch_factor=2)
+            loss = ce_loss + aux_loss
+
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+
+        batch_size = inputs.size(0)
+        total_loss += loss.item() * batch_size
+        total_ce += ce_loss.item() * batch_size
+        total_aux += aux_loss.item() * batch_size
+
+        pbar.set_postfix({"loss": loss.item(), "ce": ce_loss.item()})
+
+    n = len(loader.dataset)
+    metrics = {
+        "train/loss": total_loss / n,
+        "train/ce_loss": total_ce / n,
+        "train/aux_loss": total_aux / n,
+    }
+    if cfg.train.use_wandb:
+        wandb.log(metrics, step=epoch)
+
+    return total_loss / n
+
+@torch.no_grad()
+def evaluate(model: MemNet, loader: DataLoader, epoch: int):
+    model.eval()
+    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+    all_pos_acc = np.zeros(cfg.task.seq_len)
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]")
+    for inputs, targets in pbar:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        with autocast(enabled=cfg.train.mixed_precision):
+            logits, read_w, write_w = model(inputs, return_attn=True)
+
+        loss = ce_loss_fn(logits.view(-1, cfg.model.vocab_size), targets.view(-1))
+        total_loss += loss.item()
+
+        acc, pos_acc, util, spar = compute_metrics(logits, targets, read_w, model.memory.init_memory)  # memory approx
+        total_correct += acc * targets.size(0)
+        total_tokens += targets.size(0)
+        all_pos_acc += pos_acc
+
+        pbar.set_postfix({"val_loss": loss.item(), "acc": acc})
+
+    avg_loss = total_loss / len(loader)
+    avg_acc = total_correct / total_tokens
+    avg_pos_acc = all_pos_acc / len(loader)
+
+    metrics = {
+        "val/loss": avg_loss,
+        "val/accuracy": avg_acc,
+        "val/memory_utilization": util,
+        "val/read_sparsity": spar,
+    }
+    if cfg.train.use_wandb:
+        wandb.log(metrics, step=epoch)
+        wandb.log({f"val/pos_acc_{i}": avg_pos_acc[i] for i in range(len(avg_pos_acc))}, step=epoch)
+
+    return avg_loss, avg_acc
+
+def main(args):
+    os.makedirs(args.out, exist_ok=True)
+
+    train_dataset = get_dataset(args.task)
+    val_dataset = get_dataset(args.task)
+
+    train_loader = DataLoader(train_dataset, batch_size=cfg.train.batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.train.batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True)
 
     model = MemNet(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
     scaler = GradScaler(enabled=cfg.train.mixed_precision)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=3, factor=0.5)
-    best_acc = 0.0
-    patience_cnt = 0
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
-    for ep in range(1, cfg.train.epochs + 1):
-        tr_loss = train_epoch(model, train_loader, opt, scaler, device, cfg, ep)
-        val_loss, val_acc, pos_acc = evaluate(model, val_loader, device, cfg)
-        print(f"Epoch {ep} | tr_loss={tr_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc:.4f} | pos_acc={pos_acc}")
+    best_acc = 0.0
+    patience_counter = 0
+
+    for epoch in range(1, cfg.train.epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, scaler, epoch)
+        val_loss, val_acc = evaluate(model, val_loader, epoch)
+
         scheduler.step(val_loss)
+
+        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(save_dir, 'best_memnet.pt'))
-            patience_cnt = 0
+            torch.save(model.state_dict(), os.path.join(args.out, "best_model.pt"))
+            patience_counter = 0
+            print("  → New best model saved!")
         else:
-            patience_cnt += 1
-            if patience_cnt >= cfg.train.patience:
-                print("Early stopping")
+            patience_counter += 1
+            if patience_counter >= cfg.train.patience:
+                print("Early stopping triggered.")
                 break
 
-    print("Best val acc:", best_acc)
+    print(f"Training finished. Best validation accuracy: {best_acc:.4f}")
     
-    sample_in, sample_tgt = next(iter(val_loader))
-    sample_in = sample_in[0:1].to(device)
-    logits, read_w, write_w, memory_hist = model.forward_sequence(sample_in, return_attn=True)
-    plot_slot_dynamics(read_w.cpu().numpy(), write_w.cpu().numpy(), memory_hist, os.path.join(save_dir, 'dynamics.png'))
-    print('Saved dynamics plots')
+    model.load_state_dict(torch.load(os.path.join(args.out, "best_model.pt")))
+    model.eval()
+    sample_inputs, sample_targets = next(iter(val_loader))
+    sample_inputs = sample_inputs[:1].to(device)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='copy', choices=['copy', 'assoc', 'omniglot'])
-    parser.add_argument('--out', type=str, default='runs/copy')
+    with torch.no_grad():
+        with autocast(enabled=cfg.train.mixed_precision):
+            logits, read_w, write_w = model(sample_inputs, return_attn=True)
+
+    read_w = read_w.cpu().numpy()
+    write_w = write_w.cpu().numpy()
+
+    plot_attention_dynamics(read_w, os.path.join(args.out, "read_dynamics.png"), "Read Attention")
+    plot_attention_dynamics(write_w, os.path.join(args.out, "write_dynamics.png"), "Write Attention")
+    print(f"Visualizations saved to {args.out}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train Memory-Augmented Network")
+    parser.add_argument("--task", type=str, default="copy", choices=["copy"])
+    parser.add_argument("--out", type=str, default="runs/experiment_001", help="Output directory")
     args = parser.parse_args()
-    run_experiment(args.task, args.out)
+    main(args)
