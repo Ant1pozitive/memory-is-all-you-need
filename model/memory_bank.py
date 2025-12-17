@@ -24,16 +24,17 @@ class MultiHeadMemoryBank(nn.Module):
         self.topk = topk
         self.policy = policy
         self.init_memory = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.01)
-        nn.init.orthogonal_(self.init_memory)  # better init
+        nn.init.orthogonal_(self.init_memory)
+        self.head_merge = nn.Linear(n_heads * slot_dim, slot_dim)  # for read aggregation
         if policy == "learned":
             self.priority_mlp = nn.Linear(slot_dim, 1)
         if policy == "lru":
-            self.access_times = None  # will init in reset
+            self.access_times = None
 
     def reset_memory(self, batch_size: int, device):
         mem = self.init_memory.expand(batch_size, -1, -1).contiguous().to(device)
         if self.policy == "lru":
-            self.access_times = torch.zeros(batch_size, self.num_slots, device=device)
+            self.access_times = torch.zeros(batch_size, self.num_slots, dtype=torch.float32, device=device)
         return mem
 
     @staticmethod
@@ -45,32 +46,35 @@ class MultiHeadMemoryBank(nn.Module):
         return sim
 
     def read(self, memory: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)  # per-head beta
+        sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)
         weights, mask = topk_sparse_softmax(sim, self.topk)
         read = torch.einsum('bhn,bnd->bhd', weights, memory)
-        read_combined = read.mean(dim=1)  # or use merge layer
+        read_combined = self.head_merge(read.reshape(read.shape[0], -1))
         if self.policy == "lru":
-            self.access_times.scatter_add_(1, mask.float().argmax(-1), torch.ones_like(mask.float().argmax(-1)))
+            indices = mask.float().argmax(-1)
+            self.access_times = self.access_times.scatter_add(1, indices, torch.ones_like(indices, dtype=torch.float32))
         return read_combined, weights
 
     def write(self, memory: torch.Tensor, write_keys: torch.Tensor, write_vals: torch.Tensor,
               erase: torch.Tensor, add_gate: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         sim = self.cosine_sim(write_keys, memory) * beta.unsqueeze(-1)
+        if self.policy == "learned":
+            priorities = self.priority_mlp(memory).squeeze(-1).unsqueeze(1)  # (B,1,N)
+            sim = sim + priorities
         weights, mask = topk_sparse_softmax(sim, self.topk)
         if self.policy == "lru":
-            # evict least recent if not in top-k (simple: overwrite min access)
-            min_access = self.access_times.argmin(-1).unsqueeze(-1).unsqueeze(-1)  # (B,1,1)
-            weights.scatter_(2, min_access, 1.0) if torch.rand(1) < 0.1 else None  # occasional evict
-            self.access_times.scatter_add_(1, mask.float().argmax(-1), torch.ones_like(mask.float().argmax(-1)))
-        elif self.policy == "learned":
-            priorities = self.priority_mlp(memory).squeeze(-1)  # (B,N)
-            weights = F.softmax(sim + priorities.unsqueeze(1), dim=-1)  # bias with priority
+            low_sim_mask = (sim < 0.1).all(-1)  # evict if low sim
+            min_access_idx = self.access_times.argmin(dim=-1, keepdim=True).unsqueeze(1).expand(-1, self.n_heads, -1)  # (B,H,1)
+            eviction_mask = low_sim_mask.unsqueeze(-1)  # (B,H,1)
+            weights = weights.scatter_add(2, min_access_idx, eviction_mask.float())  # boost weight for eviction
+            indices = mask.float().argmax(-1)
+            self.access_times = self.access_times.scatter_add(1, indices, torch.ones_like(indices, dtype=torch.float32))
         w_unsq = weights.unsqueeze(-1)
-        erase_unsq = erase.unsqueeze(-1).unsqueeze(-1)  # scalar per head -> (B,H,1,1)
+        erase_unsq = erase.unsqueeze(-1).unsqueeze(-1)
         add_unsq = add_gate.unsqueeze(-1).unsqueeze(-1) * write_vals.unsqueeze(2)
         mem_exp = memory.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
         mem_after_erase = mem_exp * (1 - w_unsq * erase_unsq)
         mem_after_add = mem_after_erase + w_unsq * add_unsq
-        new_memory = mem_after_add.mean(dim=1)  # average heads
-        new_memory = F.normalize(new_memory, dim=-1)  # normalize
+        new_memory = mem_after_add.mean(dim=1)
+        new_memory = F.normalize(new_memory + 1e-8, dim=-1)
         return new_memory, weights
