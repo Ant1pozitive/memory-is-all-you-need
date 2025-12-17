@@ -17,7 +17,7 @@ def topk_sparse_softmax(sim: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.
 
 class MultiHeadMemoryBank(nn.Module):
     def __init__(self, num_slots: int, slot_dim: int, n_heads: int = 8, topk: int = 16,
-                 policy: str = "topk", use_decay_gate: bool = True):
+                 policy: str = "topk", use_decay_gate: bool = True, decay_rate: float = 0.99):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -25,6 +25,7 @@ class MultiHeadMemoryBank(nn.Module):
         self.topk = topk
         self.policy = policy
         self.use_decay_gate = use_decay_gate
+        self.decay_rate = decay_rate
 
         self.init_memory = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.01)
         nn.init.orthogonal_(self.init_memory)
@@ -56,7 +57,7 @@ class MultiHeadMemoryBank(nn.Module):
             decay = torch.sigmoid(self.decay_gate).unsqueeze(0).unsqueeze(-1)
             memory = memory * decay
         else:
-            memory = memory * cfg.memory.decay_rate
+            memory = memory * self.decay_rate
         return memory
 
     def read(self, memory: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

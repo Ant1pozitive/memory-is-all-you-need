@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from .memory_bank import MultiHeadMemoryBank
 from .controller import TransformerController
 from config import cfg
