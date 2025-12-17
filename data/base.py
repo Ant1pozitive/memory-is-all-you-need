@@ -1,11 +1,10 @@
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 import numpy as np
 import torch
 
-class TaskDataset(Dataset):
-    def __init__(self, vocab_size, size=None):  # size=None for infinite
+class TaskDataset(IterableDataset):
+    def __init__(self, vocab_size):
         self.vocab_size = vocab_size
-        self.size = size or int(1e9)  # infinite
 
-    def __len__(self):
-        return self.size
+    def __iter__(self):
+        return self
