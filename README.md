@@ -40,9 +40,9 @@ This project asks:
 
 We introduce an architecture composed of three distinct subsystems:
 
-1. **Encoder** — processes the current input
-2. **Multi-Head External Memory** — persistent across time
-3. **Controller** — decides *what to read*, *what to write*, and *what to forget*
+1. **Encoder** - processes the current input
+2. **Multi-Head External Memory** - persistent across time
+3. **Controller** - decides *what to read*, *what to write*, and *what to forget*
 
 Memory is not implemented as attention over tokens.
 
