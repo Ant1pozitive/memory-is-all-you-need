@@ -10,6 +10,8 @@ class MemoryConfig:
     policy: str = "topk"  # "topk", "lru", "learned"
     decay_rate: float = 0.99
     use_decay_gate: bool = True
+    bottleneck_dim: int = 64 # Dimension for semantic compression
+    age_decay: float = 0.995 # Rate at which slot age increases
 
 @dataclass
 class ModelConfig:
@@ -34,6 +36,7 @@ class TrainConfig:
     lambda_sparsity: float = 0.02
     lambda_diversity: float = 0.01
     lambda_forgetting: float = 0.005
+    lambda_utilization: float = 0.01 # Weight for Slot Utilization Loss
     patience: int = 10
     use_wandb: bool = False
     mixed_precision: bool = True

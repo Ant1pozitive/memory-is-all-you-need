@@ -48,6 +48,17 @@ def forgetting_loss(memory: torch.Tensor) -> torch.Tensor:
     norms = memory.norm(dim=-1).mean(dim=1)
     return norms.mean()
 
+def utilization_loss(weights: torch.Tensor) -> torch.Tensor:
+    """
+    Slot Utilization Loss: Penalizes low entropy in memory access.
+    Encourages the model to explore and use more slots, preventing addressing collapse.
+    """
+    # weights shape: (B, H, N) or (B, T, H, N)
+    avg_weights = weights.mean(dim=(0, 1)) # Average across batch and heads/time
+    eps = 1e-8
+    entropy = -torch.sum(avg_weights * torch.log(avg_weights + eps))
+    # We want to maximize entropy, so we minimize negative entropy
+    return -entropy
 
 @torch.no_grad()
 def compute_metrics(logits: torch.Tensor, targets: torch.Tensor, read_weights: torch.Tensor, memory: torch.Tensor):
@@ -87,18 +98,20 @@ def train_epoch(model: MemNet, loader: DataLoader, optimizer: torch.optim.Optimi
         targets = targets.to(device)
 
         with autocast(enabled=cfg.train.mixed_precision):
-            logits, read_w, write_w = model(inputs, return_attn=True)
-            ce_loss = ce_loss_fn(logits.view(-1, cfg.model.vocab_size), targets.view(-1))
-            last_memory = model.memory.init_memory.expand(inputs.size(0), -1, -1).to(device)
-            spar_loss = sparsity_loss(read_w.mean(dim=1)) + sparsity_loss(write_w.mean(dim=1))
-            div_loss = diversity_loss(last_memory)
-            forg_loss = forgetting_loss(last_memory)
-
-            aux_loss = (cfg.train.lambda_sparsity * spar_loss +
-                        cfg.train.lambda_diversity * div_loss +
-                        cfg.train.lambda_forgetting * forg_loss)
-
-            loss = ce_loss + aux_loss
+                    logits, read_w, write_w = model(inputs, return_attn=True)
+                    
+                    # Calculate standard losses
+                    ce_loss = ce_loss_fn(logits.view(-1, cfg.model.vocab_size), targets.view(-1))
+                    
+                    # Slot Utilization Loss
+                    util_loss = utilization_loss(read_w) + utilization_loss(write_w)
+                    
+                    # Aux losses
+                    spar_loss = sparsity_loss(read_w) + sparsity_loss(write_w)
+                    
+                    # Total loss
+                    loss = ce_loss + (cfg.train.lambda_sparsity * spar_loss) + \
+                        (cfg.train.lambda_utilization * util_loss)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -110,7 +123,7 @@ def train_epoch(model: MemNet, loader: DataLoader, optimizer: torch.optim.Optimi
         batch_size = inputs.size(0)
         total_loss += loss.item() * batch_size
         total_ce += ce_loss.item() * batch_size
-        total_aux += aux_loss.item() * batch_size
+        total_aux += spar_loss.item() * batch_size
 
         pbar.set_postfix({"loss": loss.item(), "ce": ce_loss.item()})
 
