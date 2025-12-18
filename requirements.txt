@@ -1,6 +1,10 @@
 torch>=2.0.0
-numpy
-matplotlib
-scikit-learn
+torchvision # optional, for future: in case if u want to add image tasks (Omniglot)
+numpy>=1.21.0
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
+plotly>=5.0.0
+tensorboard>=2.10.0
+Pillow>=9.0.0
 tqdm
 wandb  # optional, for logging
