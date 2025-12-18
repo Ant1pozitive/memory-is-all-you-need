@@ -38,11 +38,12 @@ This project asks:
 
 ## Core Idea
 
-We introduce an architecture composed of three distinct subsystems:
+We introduce an architecture composed of four distinct subsystems:
 
-1. **Encoder** - processes the current input
-2. **Multi-Head External Memory** - persistent across time
-3. **Controller** - decides *what to read*, *what to write*, and *what to forget*
+1. **Encoder** - processes the current input.
+2. **Semantic Bottleneck** - filters and compresses information before storage.
+3. **Multi-Head External Memory** - slot-based persistent storage across time.
+4. **Controller** - a Transformer-based brain that decides *what to read*, *what to write*, and *what to forget*.
 
 Memory is not implemented as attention over tokens.
 
@@ -67,10 +68,20 @@ Each forward pass includes **memory I/O operations**, making memory dynamics obs
 
 ### 2. Multi-Head Sparse Addressing
 
-* Multiple independent memory heads
-* Each head produces a query
-* Top-k cosine similarity addressing
-* Softmax-normalized sparse weights
+* Multiple independent memory heads for parallel access.
+* **Top-k cosine similarity** addressing reduces interference and noise.
+* Softmax-normalized sparse weights ensure focused updates.
+
+### 3. Semantic Compression (Information Bottleneck)
+To prevent memory saturation with noise, we implement an MLP-based bottleneck. It forces the model to extract invariant features before writing, ensuring that each slot stores high-value information.
+
+### 4. Age-based Forgetting (LRU Logic)
+Unlike standard MANNs, we track the **age** and **usage** of each slot. The write policy prioritizes overwriting "stale" or "least recently used" slots, preventing memory overflow in extremely long sequences.
+
+### 5. Structural Stability (LayerNorm & Residuals)
+To ensure deep gradient flow across thousands of timesteps:
+* **LayerNorm** is applied to read vectors to stabilize activation magnitudes.
+* **Residual Memory Connections** allow the model to refine its internal state incrementally.
 
 This enables:
 
@@ -78,7 +89,7 @@ This enables:
 * Functional specialization of heads
 * Reduced interference
 
-### 3. Learnable Read / Write Policies
+### 6. Learnable Read / Write Policies
 
 Memory updates are controlled by:
 
@@ -88,7 +99,7 @@ Memory updates are controlled by:
 
 Writes are *not* forced at every step.
 
-### 4. Differentiable Forgetting
+### 7. Differentiable Forgetting
 
 Memory decay is implemented as a learnable process:
 
@@ -100,48 +111,66 @@ Forgetting becomes an optimization objective, not a side effect.
 
 ---
 
+## Optimization & Training
+
+### Slot Utilization Loss
+To prevent **addressing collapse** (where the model uses only a few slots), we optimize for high entropy in memory access:
+
+$$L_{util} = -\sum_{i=1}^{N} \bar{w}_i \log(\bar{w}_i + \epsilon)$$
+
+Where $\bar{w}$ is the average attention weight across heads and batch. This forces the model to explore the entire memory capacity.
+
+### Mixed Precision & Sparsity
+The training pipeline supports `torch.cuda.amp` and uses entropy-based penalties to encourage sparse, interpretable memory access patterns.
+
+---
+
 ## Architecture Overview
 
-```
-Input → Encoder → Controller
-                     ↓
-              Multi-Head Memory
-                     ↓
-               Read Vectors
-                     ↓
-                Prediction
-```
-
-Each timestep produces:
-
-* Model output
-* Memory read weights
-* Memory write masks
-* Slot utilization statistics
-
-These signals are logged for analysis and visualization.
+       ┌────────────────────────────────────────────────────────┐
+       │                 Input Sequence (Tokens)                │
+       └──────────────────────────┬─────────────────────────────┘
+                                  ▼
+                    ┌───────────────────────────┐
+                    │  Transformer Controller   │◄──────────┐
+                    │ (Contextual Reasoning)    │           │
+                    └──────┬─────────────┬──────┘           │
+                           │             │                  │
+           ┌───────────────┘             └──────────────┐   │ (Residual 
+           ▼                                            ▼   │  Read Vector)
+    ┌─────────────┐                             ┌───────────────┐   │
+    │ Read Heads  │                             │  Write Heads  │   │
+    │ (Top-k Sim) │                             │ (Gated Update)│   │
+    └──────┬──────┘                             └───────┬───────┘   │
+           │                                            ▼           │
+           │                             ┌────────────────────────┐ │
+           │                             │   Semantic Bottleneck  │ │
+           │                             │ (Information Filter)   │ │
+           │                             └──────────────┬─────────┘ │
+           ▼                                            ▼           │
+    ┌───────────────────────────────────────────────────────────┐   │
+    │                 Multi-Head Memory Bank                    │   │
+    │      (N Slots × D Dimensions | Age & Usage Buffers)       │   │
+    └──────────────────────────┬────────────────────────────────┘   │
+                               │                                    │
+                               ▼                                    │
+                    ┌───────────────────────────┐                   │
+                    │   Residual Fusion Layer   ├───────────────────┘
+                    │ (Current Read + History)  │
+                    └──────────┬────────────────┘
+                               ▼
+                    ┌───────────────────────────┐
+                    │      Prediction Head      │
+                    │   (Output Logits / Task)  │
+                    └───────────────────────────┘
 
 ---
 
 ## Implemented Components
 
-### Memory Module
-
-* `MultiHeadMemory`
-* Top-k sparse addressing
-* Per-head read/write operations
-* Slot utilization tracking
-
-### Controller
-
-* Produces read queries
-* Produces write keys and values
-* Outputs gating signals
-
-### Models
-
-* Memory-Augmented Transformer-style encoder
-* Memory-Augmented sequence predictor
+* **`MultiHeadMemoryBank`**: Core storage with Top-k addressing and age tracking.
+* **`TransformerController`**: A causal Transformer that manages I/O keys and gates.
+* **`MemNet`**: The end-to-end model integrating memory and computation.
 
 ---
 
@@ -161,8 +190,6 @@ Metrics:
 * Memory slot reuse
 * Read sparsity
 
----
-
 ### 2. Continual Learning with Distribution Shifts
 
 **Goal:**
@@ -178,8 +205,6 @@ Baseline comparisons:
 * Transformer without memory
 * RNN/LSTM
 
----
-
 ### 3. Learned Forgetting Dynamics
 
 **Goal:**
@@ -191,24 +216,12 @@ Tracked signals:
 * Write frequency
 * Entropy of read distributions
 
----
-
 ## Visualization
 
 The repository includes tools for visualizing memory behavior:
 
-### Memory Slot Dynamics
-
-* Heatmaps of slot activations over time
-* Head-specific access patterns
-* Slot survival curves
-
-### Sparse Addressing
-
-* Top-k attention masks
-* Head specialization plots
-
-These visualizations turn memory from a black box into an analyzable system.
+* **Heatmaps**: Observe how information travels through slots over time.
+* **Slot Survival Curves**: Track which information the model deems "worth remembering" vs "worth forgetting".
 
 ---
 
