@@ -16,10 +16,29 @@ def topk_sparse_softmax(sim: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.
     weights = F.softmax(masked, dim=-1)
     return weights, mask
 
+class MemorySynthesizer(nn.Module):
+    """
+    Implements 'Imaginative Replay': Allows memory slots to attend to each other
+    and synthesize new abstract representations without external input.
+    """
+    def __init__(self, slot_dim: int, n_heads: int, n_layers: int):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=slot_dim, nhead=n_heads, dim_feedforward=slot_dim * 2,
+            batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        # memory: [B, Slots, Dim]
+        # Self-attention over slots (inter-slot communication)
+        refined_memory = self.transformer(memory)
+        return refined_memory
+
 class MultiHeadMemoryBank(nn.Module):
     def __init__(self, num_slots: int, slot_dim: int, n_heads: int = 8, topk: int = 16,
-                 policy: str = "topk", use_decay_gate: bool = True, decay_rate: float = 0.99,
-                 bottleneck_dim: int = 64):
+                 policy: str = "meta", use_decay_gate: bool = True, decay_rate: float = 0.99,
+                 bottleneck_dim: int = 64, n_synthesis_layers: int = 2, synthesis_heads: int = 4):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
@@ -29,20 +48,25 @@ class MultiHeadMemoryBank(nn.Module):
         self.use_decay_gate = use_decay_gate
         self.decay_rate = decay_rate
 
-        # Information Bottleneck: Compresses information before writing to memory
+        # Semantic Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Linear(slot_dim, bottleneck_dim),
             nn.GELU(),
             nn.Linear(bottleneck_dim, slot_dim)
         )
 
+        # Neural Memory Synthesizer (The "Dreaming" Module)
+        self.synthesizer = MemorySynthesizer(slot_dim, synthesis_heads, n_synthesis_layers)
+
+        # Meta-Policy Gates: [TopK, Uniform, Random]
+        if policy == "meta":
+            self.meta_gate = nn.Linear(slot_dim, 3) 
+
         self.init_memory = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.01)
         nn.init.orthogonal_(self.init_memory)
 
-        # Buffers for Age-based forgetting and utilization tracking
         self.register_buffer("age", torch.zeros(1, num_slots))
         
-        # LayerNorm for reading stability
         self.norm = nn.LayerNorm(slot_dim)
         self.head_merge = nn.Linear(n_heads * slot_dim, slot_dim)
 
@@ -70,43 +94,60 @@ class MultiHeadMemoryBank(nn.Module):
             memory = memory * self.decay_rate
         return memory
 
+    def synthesize(self, memory: torch.Tensor) -> torch.Tensor:
+        """Runs the internal synthesis process (residual update)"""
+        delta = self.synthesizer(memory)
+        # Residual connection: Memory = Memory + Synthesis
+        return F.normalize(memory + 0.1 * delta, dim=-1)
+
     def read(self, memory: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)
-        weights, mask = topk_sparse_softmax(sim, self.topk)
+        
+        # Base Top-K weights
+        w_topk, mask = topk_sparse_softmax(sim, self.topk)
 
-        read_per_head = torch.einsum('bhn,bnd->bhd', weights, memory)
+        if self.policy == "meta":
+            # Compute mixing coefficients based on Query
+            # gate_logits: [B, H, 3]
+            gate_logits = self.meta_gate(read_keys) 
+            gate_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1) # [B, H, 3, 1]
+
+            # 1. Top-K Strategy
+            # 2. Uniform Strategy (Exploration)
+            w_uniform = torch.ones_like(w_topk) / self.num_slots
+            # 3. Random Strategy (Noise/Dream)
+            w_random = F.softmax(torch.randn_like(sim), dim=-1)
+
+            # Mix policies
+            # Stack: [B, H, 3, N]
+            w_stack = torch.stack([w_topk, w_uniform, w_random], dim=2)
+            final_weights = (w_stack * gate_weights).sum(dim=2) # Weighted sum
+        else:
+            final_weights = w_topk
+
+        read_per_head = torch.einsum('bhn,bnd->bhd', final_weights, memory)
         read_combined = self.head_merge(read_per_head.reshape(read_per_head.shape[0], -1))
         
-        # Apply LayerNorm for numerical stability across deep timesteps
         read_combined = self.norm(read_combined)
 
-        # Update Age: slots that are read have their age reset
         with torch.no_grad():
-            accessed_slots = mask.any(dim=1).float() # [B, N]
+            accessed_slots = mask.any(dim=1).float()
             self.age = self.age * (1 - accessed_slots) + accessed_slots * 0.0
 
-        return read_combined, weights
+        return read_combined, final_weights
 
     def write(self, memory: torch.Tensor, write_keys: torch.Tensor, write_vals: torch.Tensor,
               erase: torch.Tensor, add_gate: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        # Age-based logic: Increment age for all slots
         with torch.no_grad():
             self.age += 1.0
 
-        # Apply Bottleneck to write values
         compressed_vals = self.bottleneck(write_vals)
-
         sim = self.cosine_sim(write_keys, memory) * beta.unsqueeze(-1)
 
-        # If policy is LRU, bias writing towards older slots
-        if self.policy == "lru":
-            age_bias = (self.age / (self.age.max() + 1e-8)).unsqueeze(1)
-            sim = sim + age_bias
-
-        if self.policy == "learned":
-            priorities = self.priority_mlp(memory).squeeze(-1).unsqueeze(1)
-            sim = sim + priorities
+        # LRU Bias
+        age_bias = (self.age / (self.age.max() + 1e-8)).unsqueeze(1)
+        sim = sim + age_bias
 
         weights, _ = topk_sparse_softmax(sim, self.topk)
 
@@ -117,11 +158,9 @@ class MultiHeadMemoryBank(nn.Module):
         mem_exp = memory.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
         mem_after_erase = mem_exp * (1 - w_unsq * erase_unsq)
         
-        # New memory is a mean of head updates
         new_memory = mem_after_erase + w_unsq * add_unsq
         new_memory = new_memory.mean(dim=1)
         
-        # Final normalization and decay
         new_memory = F.normalize(new_memory + 1e-8, dim=-1)
         new_memory = self.apply_decay(new_memory)
 

@@ -1,14 +1,5 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import torch
-import json
-import os
-
-def save_config(out_dir: str):
-    os.makedirs(out_dir, exist_ok=True)
-    config_path = os.path.join(out_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
-    print(f"Configuration saved to {config_path}")
 
 @dataclass
 class MemoryConfig:
@@ -16,11 +7,16 @@ class MemoryConfig:
     dim: int = 128
     heads: int = 8
     topk: int = 16
-    policy: str = "topk"  # "topk", "lru", "learned"
+    policy: str = "meta"  # Changed to "meta" to enable Meta-Policy
     decay_rate: float = 0.99
     use_decay_gate: bool = True
-    bottleneck_dim: int = 64  # Dimension for semantic compression
-    age_decay: float = 0.995  # Rate at which slot age increases
+    bottleneck_dim: int = 64
+    age_decay: float = 0.995
+    
+    # Neural Synthesis & Inter-Slot Attention params
+    n_synthesis_layers: int = 2
+    synthesis_heads: int = 4
+    synthesis_interval: int = 1  # How often to run synthesis (every N steps)
 
 @dataclass
 class ModelConfig:
@@ -45,7 +41,8 @@ class TrainConfig:
     lambda_sparsity: float = 0.02
     lambda_diversity: float = 0.01
     lambda_forgetting: float = 0.005
-    lambda_utilization: float = 0.01  # Weight for Slot Utilization Loss
+    lambda_utilization: float = 0.01
+    lambda_hallucination: float = 0.1  # loss weight for reconstruction
     patience: int = 10
     use_wandb: bool = False
     mixed_precision: bool = True
