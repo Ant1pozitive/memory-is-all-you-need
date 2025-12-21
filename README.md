@@ -81,27 +81,32 @@ graph TD
     Input[Input Sequence] --> Encoder
     Encoder --> Controller
     
-    subgraph "Active Memory System"
-        Controller -- "Meta-Policy (TopK/Unif/Rand)" --> Read[Read Heads]
-        Read --> MemoryBank[Memory Slots]
+    subgraph "Hebbian Graph Memory"
+        direction TB
+        Slots((Memory Slots))
+        Graph[Adjacency Matrix]
         
-        Bottleneck[Semantic Bottleneck] --> Write[Write Heads]
-        Controller -- "Features" --> Bottleneck
-        Write --> MemoryBank
-        
-        MemoryBank -- "Self-Attention (Dreaming)" --> Synthesizer[Memory Synthesizer]
-        Synthesizer -.->|Residual Update| MemoryBank
+        Slots <-->|STDP Update| Graph
+        Graph -->|Spreading Activation| Read
     end
     
-    MemoryBank --> ReadVec[Read Vectors]
+    Controller -- "Query" --> Read[Read Heads]
+    Read --> Slots
+    
+    Controller -- "Features" --> Bottleneck[Semantic Bottleneck]
+    Bottleneck --> Write[Write Heads]
+    Write --> Slots
+    
+    Slots -- "Dreaming (Self-Attn)" --> Synthesizer[Memory Synthesizer]
+    Synthesizer -.->|Residual Refinement| Slots
+    
+    Slots --> ReadVec[Read Vectors]
+    ReadVec --> ReconHead[Hallucination Head]
     ReadVec --> Fusion[Fusion Layer]
-    Controller --> Fusion
+    Controller --> Fusion --> Output
     
-    Fusion --> TaskHead[Task Prediction]
-    ReadVec --> ReconHead[Hallucination/Reconstruction]
-    
-    style MemoryBank fill:#f9f,stroke:#333,stroke-width:4px
-    style Synthesizer fill:#bbf,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5
+    style Graph fill:#f96,stroke:#333,stroke-width:2px
+    style Slots fill:#f9f,stroke:#333,stroke-width:4px
 ```
 
 ---
