@@ -3,20 +3,34 @@ import torch
 
 @dataclass
 class MemoryConfig:
+    # Basic Structure
     slots: int = 128
     dim: int = 128
     heads: int = 8
     topk: int = 16
-    policy: str = "meta"  # Changed to "meta" to enable Meta-Policy
+    
+    # Policies
+    # "meta" enables the dynamic mixing of Top-K, Uniform, and Random strategies
+    policy: str = "meta"  
+    
+    # Decay & Age
     decay_rate: float = 0.99
     use_decay_gate: bool = True
-    bottleneck_dim: int = 64
     age_decay: float = 0.995
     
-    # Neural Synthesis & Inter-Slot Attention params
+    # Semantic Compression
+    bottleneck_dim: int = 64
+    
+    # Neural Synthesis (Dreaming)
     n_synthesis_layers: int = 2
     synthesis_heads: int = 4
-    synthesis_interval: int = 1  # How often to run synthesis (every N steps)
+    synthesis_interval: int = 4  # Run synthesis every N steps
+    
+    # Hebbian Graph Memory
+    use_hebbian_graph: bool = True
+    hebbian_lr: float = 0.05       # Learning rate for graph connections
+    hebbian_decay: float = 0.995   # Decay factor for graph edges (forgetting old links)
+    graph_influence: float = 0.2   # How much the graph affects the read operation (alpha)
 
 @dataclass
 class ModelConfig:
@@ -38,11 +52,13 @@ class TrainConfig:
     lr: float = 1e-4
     epochs: int = 50
     grad_clip: float = 1.0
+    
+    # Loss Weights
     lambda_sparsity: float = 0.02
     lambda_diversity: float = 0.01
-    lambda_forgetting: float = 0.005
     lambda_utilization: float = 0.01
-    lambda_hallucination: float = 0.1  # loss weight for reconstruction
+    lambda_hallucination: float = 0.1  # Reconstruction loss weight
+    
     patience: int = 10
     use_wandb: bool = False
     mixed_precision: bool = True

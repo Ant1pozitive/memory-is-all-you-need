@@ -8,35 +8,52 @@ class MemNet(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+
         self.memory = MultiHeadMemoryBank(
-            cfg.memory.slots, cfg.memory.dim, cfg.memory.heads, cfg.memory.topk,
-            cfg.memory.policy, cfg.memory.use_decay_gate, cfg.memory.decay_rate,
-            cfg.memory.bottleneck_dim, cfg.memory.n_synthesis_layers, cfg.memory.synthesis_heads
+            num_slots=cfg.memory.slots, 
+            slot_dim=cfg.memory.dim, 
+            n_heads=cfg.memory.heads, 
+            topk=cfg.memory.topk,
+            policy=cfg.memory.policy, 
+            use_decay_gate=cfg.memory.use_decay_gate, 
+            decay_rate=cfg.memory.decay_rate,
+            bottleneck_dim=cfg.memory.bottleneck_dim, 
+            n_synthesis_layers=cfg.memory.n_synthesis_layers, 
+            synthesis_heads=cfg.memory.synthesis_heads,
+            use_hebbian_graph=cfg.memory.use_hebbian_graph,
+            hebbian_lr=cfg.memory.hebbian_lr,
+            hebbian_decay=cfg.memory.hebbian_decay,
+            graph_influence=cfg.memory.graph_influence
         )
+        
         self.controller = TransformerController(
             cfg.model.vocab_size, cfg.model.embed_dim, cfg.model.hidden_dim,
             cfg.memory.dim, cfg.memory.heads, cfg.model.num_layers,
             cfg.model.num_heads_attn, cfg.model.max_seq_len
         )
         
-        # Hallucination Head: Tries to reconstruct the original input from the memory read vector.
-        # This ensures the memory captures sufficient information to "imagine" the input.
+        # Hallucination Head:
+        # Reconstructs the original input embedding from the memory read vector
         self.hallucination_head = nn.Linear(cfg.memory.dim, cfg.model.embed_dim)
 
     def forward(self, input_seq: torch.Tensor, return_attn: bool = False):
         B, T = input_seq.shape
         device = input_seq.device
+        
+        # Reset memory and graph state at start of sequence
         memory = self.memory.reset_memory(B, device)
         read_vec = torch.zeros(B, self.cfg.memory.dim, device=device)
 
         logits_list = []
-        recon_list = [] # For hallucination loss
+        recon_list = [] 
         
         read_weights_hist = [] if return_attn else None
         write_weights_hist = [] if return_attn else None
 
         for t in range(T):
             current_input = input_seq[:, :t+1]
+            
+            # Controller Step
             logits, read_key, write_key, write_val, erase, add_gate = self.controller(
                 current_input, read_vec, t
             )
@@ -52,7 +69,7 @@ class MemNet(nn.Module):
 
             # 3. SYNTHESIZE (Imaginative Replay)
             # Run synthesis periodically to allow slots to share info
-            if t % self.cfg.memory.synthesis_interval == 0:
+            if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
                 memory = self.memory.synthesize(memory)
 
             # 4. HALLUCINATE (Reconstruction)

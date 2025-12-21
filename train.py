@@ -28,6 +28,7 @@ def get_dataset(task: str):
         raise ValueError(f"Unknown task: {task}")
 
 def sparsity_loss(weights: torch.Tensor) -> torch.Tensor:
+    """Encourages sparse memory access."""
     eps = 1e-6
     return -torch.mean(weights * torch.log(weights + eps))
 
@@ -56,17 +57,15 @@ def train_epoch(model: MemNet, loader: DataLoader, optimizer: torch.optim.Optimi
         targets = targets.to(device)
 
         with autocast(enabled=cfg.train.mixed_precision):
-            # Forward pass now returns reconstruction vectors too
+            # Forward pass returns logits and reconstruction vectors
             logits, recon_vecs, read_w, write_w = model(inputs, return_attn=True)
             
             # 1. Main Task Loss
             ce_loss = ce_loss_fn(logits.view(-1, cfg.model.vocab_size), targets.view(-1))
             
             # 2. Hallucination (Reconstruction) Loss
-            # Target is the embedding of the input sequence
             with torch.no_grad():
                 target_embeds = embed_layer(inputs) # [B, T, E]
-            
             hal_loss = F.mse_loss(recon_vecs, target_embeds)
             
             # 3. Aux Losses
@@ -166,15 +165,28 @@ def main(args):
             best_acc = val_acc
             torch.save(model.state_dict(), os.path.join(args.out, "best_model.pt"))
             patience_counter = 0
+            print("--> New best model saved!")
         else:
             patience_counter += 1
             if patience_counter >= cfg.train.patience:
                 print("Early stopping.")
                 break
+    
+    # Save visualizations for the best model
+    model.load_state_dict(torch.load(os.path.join(args.out, "best_model.pt")))
+    model.eval()
+    sample_inputs, _ = next(iter(val_loader))
+    sample_inputs = sample_inputs[:1].to(device)
+    
+    with torch.no_grad():
+        _, _, read_w, write_w = model(sample_inputs, return_attn=True)
+        
+    plot_attention_dynamics(read_w.cpu().numpy(), os.path.join(args.out, "read_pattern.png"), "Read Attention")
+    plot_attention_dynamics(write_w.cpu().numpy(), os.path.join(args.out, "write_pattern.png"), "Write Attention")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="copy")
-    parser.add_argument("--out", type=str, default="runs/experiment_meta")
+    parser.add_argument("--out", type=str, default="runs/experiment_hebbian")
     args = parser.parse_args()
     main(args)
