@@ -28,7 +28,7 @@ Transformers dominate sequence modeling but suffer from "Cognitive Myopia":
 
 ## The Paradigm Shift
 
-> **"Neurons that fire together, wire together." — Donald Hebb (1949)**
+> **"Neurons that fire together, wire together." - Donald Hebb (1949)**
 
 Modern Transformers suffer from **"Associative Blindness"**: they can recall $A$ if asked for $A$, but they struggle to spontaneously recall $B$ when seeing $A$, unless $A$ and $B$ were explicitly close in the training context.
 
@@ -49,7 +49,7 @@ The model operates in a continuous 4-stage cycle:
 3.  **Consolidation (Write & Link)**: 
     * Writes new data to slots.
     * **Updates the Graph**: Uses a temporal Hebbian rule (STDP) to strengthen connections between the previously active slots and the current ones.
-4.  **Dreaming (Synthesis)**: Periodically goes offline to "dream" — running self-attention over memory slots to discover latent connections and merge redundant knowledge.
+4.  **Dreaming (Synthesis)**: Periodically goes offline to "dream" - running self-attention over memory slots to discover latent connections and merge redundant knowledge.
 
 ---
 
