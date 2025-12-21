@@ -26,39 +26,56 @@ Transformers dominate sequence modeling but suffer from "Cognitive Myopia":
 
 ---
 
+## The Paradigm Shift
+
+> **"Neurons that fire together, wire together." — Donald Hebb (1949)**
+
+Modern Transformers suffer from **"Associative Blindness"**: they can recall $A$ if asked for $A$, but they struggle to spontaneously recall $B$ when seeing $A$, unless $A$ and $B$ were explicitly close in the training context.
+
+**We solve this by making memory a Graph.**
+
+Instead of a flat list of slots, our memory tracks **relationships**. If the model reads "Fire" and then "Smoke" sequentially, a directed edge `Fire -> Smoke` is strengthened in the memory's adjacency matrix. Future queries for "Fire" will physically activate the "Smoke" slot via **Spreading Activation**, even without direct attention.
+
+---
+
 ## Core Architecture
 
-We introduce a four-stage cognitive cycle:
+The model operates in a continuous 4-stage cycle:
 
-1.  **Perception (Encoder)**: Processes sensory input.
-2.  **Compression (Bottleneck)**: Distills information into invariant semantic features.
-3.  **Cognition (Controller + Meta-Policy)**: Decides *how* to access memory (Focus vs. Explore) and *what* to do with it.
-4.  **Consolidation (Synthesizer)**: A self-supervised process that refines and reorganizes memory slots without external input.
+1.  **Perception (Encoder)**: Compresses sensory input into invariant features.
+2.  **Associative Recall (Hebbian Read)**: 
+    * Retrieves information via similarity (Top-K).
+    * *Crucially*, activation spreads through the graph edges to recall related concepts (Spreading Activation).
+3.  **Consolidation (Write & Link)**: 
+    * Writes new data to slots.
+    * **Updates the Graph**: Uses a temporal Hebbian rule (STDP) to strengthen connections between the previously active slots and the current ones.
+4.  **Dreaming (Synthesis)**: Periodically goes offline to "dream" — running self-attention over memory slots to discover latent connections and merge redundant knowledge.
 
 ---
 
 ## Key Features
 
-### 1. Neural Memory Synthesis ("Dreaming")
+### 1. Hebbian Graph Memory (The Brain)
+We implement a differentiable **Adjacency Matrix** $A$ that evolves online.
+* **Update Rule (STDP):** $\Delta A_{ij} = \eta \cdot (\text{Pre}_i \times \text{Post}_j)$. If Slot $i$ was active at $t-1$ and Slot $j$ is active at $t$, the link $i \to j$ grows.
+* **Spreading Activation:** When reading, the attention weights $W$ diffuse through the graph: 
+    $$W_{final} = (1-\alpha)W_{base} + \alpha(W_{base} \times A)$$
+    This allows the model to "remember" things it didn't explicitly look for.
+
+### 2. Neural Memory Synthesis ("Dreaming")
 Just as humans consolidate memories during sleep, this model runs a **Self-Attention mechanism over memory slots** periodically. This allows the system to:
 * Discover latent connections between temporally distant events.
 * Merge redundant information.
 * Form abstract representations independent of the input stream.
 
-### 2. Meta-Policy Addressing
+### 3. Meta-Policy Addressing
 The model is not forced to use just one retrieval strategy. A learned gating mechanism dynamically mixes three policies:
 * **Top-K:** For precise, factual retrieval.
 * **Uniform:** For gathering global context.
 * **Random:** For stochastic exploration and breaking local minima.
 
-### 3. Hallucination-based Learning
-To ensure the memory captures the *essence* of the input, we introduce a **Reconstruction Head**. The model must be able to "hallucinate" (reconstruct) the original input solely from its memory read vectors. This forces the memory to be semantically rich and sufficient.
-
-### 4. Semantic Compression (Bottleneck)
-An MLP-based bottleneck filters noise before writing, ensuring that memory slots store high-density semantic embeddings rather than raw hidden states.
-
-### 5. Age-based Forgetting (LRU)
-We track the "age" of every memory slot. The system automatically prioritizes preserving frequently accessed knowledge while allowing stale information to decay or be overwritten.
+### 4. Hallucination-based Learning
+To ensure the memory captures the *essence* of the input, we introduce a **Reconstruction Head**. The model is penalized if it cannot "hallucinate" (reconstruct) the original input solely from its memory read vectors.
 
 ---
 
