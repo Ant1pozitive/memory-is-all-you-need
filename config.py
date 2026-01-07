@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 @dataclass
@@ -67,9 +67,9 @@ class TrainConfig:
 class BaseConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
-    model: ModelConfig = ModelConfig()
-    memory: MemoryConfig = MemoryConfig()
-    task: TaskConfig = TaskConfig()
-    train: TrainConfig = TrainConfig()
+    model: ModelConfig = field(default_factory=ModelConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
 
 cfg = BaseConfig()
