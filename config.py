@@ -31,6 +31,11 @@ class MemoryConfig:
     hebbian_lr: float = 0.05       # Learning rate for graph connections
     hebbian_decay: float = 0.995   # Decay factor for graph edges (forgetting old links)
     graph_influence: float = 0.2   # How much the graph affects the read operation (alpha)
+    graph_rank: int = 32           # Rank for low-rank approximation of adjacency matrix
+
+    # Sparse Attention (LSH)
+    use_lsh: bool = True           # Enable Locality-Sensitive Hashing for sparse sim
+    hash_buckets: int = 32         # Number of hash buckets for LSH
 
 @dataclass
 class ModelConfig:
