@@ -52,8 +52,7 @@ class MultiHeadMemoryBank(nn.Module):
                  policy: str = "meta", use_decay_gate: bool = True, decay_rate: float = 0.99,
                  bottleneck_dim: int = 64, n_synthesis_layers: int = 2, synthesis_heads: int = 4,
                  use_hebbian_graph: bool = True, hebbian_lr: float = 0.05, 
-                 hebbian_decay: float = 0.995, graph_influence: float = 0.2,
-                 graph_rank: int = 32, use_lsh: bool = True, hash_buckets: int = 32):
+                 hebbian_decay: float = 0.995, graph_influence: float = 0.2):
         super().__init__()
         
         self.num_slots = num_slots
@@ -67,12 +66,11 @@ class MultiHeadMemoryBank(nn.Module):
         self.hebbian_lr = hebbian_lr
         self.hebbian_decay = hebbian_decay
         self.graph_influence = graph_influence
-        self.graph_rank = graph_rank
 
-        # Low-rank adjacency: U [B, Slots, Rank], V [B, Rank, Slots]
-        # Effective adjacency = U @ V
-        self.register_buffer("U", torch.zeros(1, num_slots, graph_rank))
-        self.register_buffer("V", torch.zeros(1, graph_rank, num_slots))
+        # Adjacency Matrix: [B, Slots, Slots]
+        # Stores the directed associative strength between slots.
+        # Not a learnable Parameter (updated via STDP rule).
+        self.register_buffer("adjacency", torch.zeros(1, num_slots, num_slots))
         
         # Buffer to track previous access pattern for temporal association
         self.register_buffer("prev_access_mean", torch.zeros(1, num_slots))
@@ -112,18 +110,11 @@ class MultiHeadMemoryBank(nn.Module):
         
         if policy == "learned":
             self.priority_mlp = nn.Linear(slot_dim, 1)
-        
-        # Sparse Attention with LSH
-        self.use_lsh = use_lsh
-        self.hash_buckets = hash_buckets
-        if use_lsh:
-            self.random_projections = nn.Parameter(torch.randn(slot_dim, hash_buckets // 2))
 
     def reset_memory(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Resets memory states, graph connections, and age buffers."""
         self.age = torch.zeros(batch_size, self.num_slots, device=device)
-        self.U = torch.zeros(batch_size, self.num_slots, self.graph_rank, device=device)
-        self.V = torch.zeros(batch_size, self.graph_rank, self.num_slots, device=device)
+        self.adjacency = torch.zeros(batch_size, self.num_slots, self.num_slots, device=device)
         self.prev_access_mean = torch.zeros(batch_size, self.num_slots, device=device)
         
         return self.init_memory.expand(batch_size, -1, -1).clone().to(device)
@@ -153,64 +144,68 @@ class MultiHeadMemoryBank(nn.Module):
 
     def update_hebbian_graph(self, current_weights: torch.Tensor):
         """
-        Updates the low-rank factors U and V using a temporal Hebbian rule.
+        Updates the adjacency matrix using a temporal Hebbian rule.
+        Logic: If Slot A (prev) and Slot B (curr) are active sequentially,
+        strengthen the directed edge A -> B.
         """
         if not self.use_hebbian_graph:
             return
 
         with torch.no_grad():
+            # current_weights: [B, H, N]
+            # Aggregate heads to get general slot activation
             curr_act = current_weights.mean(dim=1)  # [B, N]
             prev_act = self.prev_access_mean        # [B, N]
 
-            # Outer product approximation for low-rank: hebbian_update ≈ prev_act.unsqueeze(2) @ curr_act.unsqueeze(1)
-            # But for low-rank, add to U/V incrementally (approximate)
-            delta_U = prev_act.unsqueeze(2) * self.hebbian_lr  # [B, N, 1] but expand to rank if needed;
-            delta_V = curr_act.unsqueeze(1) * self.hebbian_lr  # [B, 1, N]
+            # Outer product: [B, N, 1] @ [B, 1, N] -> [B, N, N]
+            # Defines association Strength(Prev -> Curr)
+            hebbian_update = torch.bmm(prev_act.unsqueeze(2), curr_act.unsqueeze(1))
             
-            # For full rank, we can accumulate; but to keep rank, use rank-1 update (Woodbury or similar, but simple add)
-            self.U = (self.U * self.hebbian_decay) + torch.cat([self.U[:, :, :-1], delta_U], dim=-1) if self.U.shape[-1] > self.graph_rank else self.U + delta_U.expand(-1, -1, self.graph_rank)
-            self.V = (self.V * self.hebbian_decay) + torch.cat([self.V[:, :-1, :], delta_V], dim=1) if self.V.shape[1] > self.graph_rank else self.V + delta_V.expand(-1, self.graph_rank, -1)
+            # Update adjacency: Decay old connections + Learn new ones
+            self.adjacency = (self.adjacency * self.hebbian_decay) + (self.hebbian_lr * hebbian_update)
             
-            # Clamp to prevent explosion
-            self.U = torch.clamp(self.U, -1.0, 1.0)
-            self.V = torch.clamp(self.V, -1.0, 1.0)
+            # Normalize to prevent explosion (row-wise max constraint)
+            self.adjacency = torch.clamp(self.adjacency, max=1.0)
             
+            # Store current activation for the next step
             self.prev_access_mean = curr_act.detach()
 
     def read(self, memory: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Reads from memory using Meta-Policy and Spreading Activation, with sparse LSH for efficiency.
+        Reads from memory using Meta-Policy and Spreading Activation.
         """
-        # 1. Compute Base Similarity (with optional LSH for sparse)
-        if self.use_lsh:
-            # LSH: Project to hashes, find buckets
-            proj_keys = torch.sign(read_keys @ self.random_projections)  # [B, H, buckets/2]
-            proj_mem = torch.sign(memory @ self.random_projections)  # [B, N, buckets/2]
-            buckets = (proj_keys.unsqueeze(2) == proj_mem.unsqueeze(1)).float().mean(-1) > 0.5  # Approximate match [B, H, N]
-            sim = self.cosine_sim(read_keys, memory) * buckets * beta.unsqueeze(-1)
-        else:
-            sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)
-        
-        w_base, mask = topk_sparse_softmax(sim, self.topk)  # [B, H, N]
+        # 1. Compute Base Similarity
+        sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)
+        w_base, mask = topk_sparse_softmax(sim, self.topk) # [B, H, N]
 
-        # 2. Hebbian Spreading Activation (using low-rank adjacency)
+        # 2. Hebbian Spreading Activation
+        # Allows activation to flow through graph edges: W_final = W_base + alpha * (W_base @ Adjacency)
         if self.use_hebbian_graph:
-            # Reconstructed adjacency ≈ self.U @ self.V [B, N, N]
-            adjacency_approx = torch.bmm(self.U, self.V)
+            # adjacency: [B, N, N]
+            # w_base: [B, H, N]
+            # spread: [B, H, N]
+            spread_signal = torch.matmul(w_base, self.adjacency)
             
-            spread_signal = torch.bmm(w_base, adjacency_approx)  # [B, H, N]
-            
+            # Combine base attention with associative recall
             w_combined = w_base + (self.graph_influence * spread_signal)
+            
+            # Re-normalize to ensure they sum to 1
             w_final = w_combined / (w_combined.sum(dim=-1, keepdim=True) + 1e-8)
         else:
             w_final = w_base
 
         # 3. Meta-Policy Mixing
         if self.policy == "meta":
+            # Determine policy weights based on query content
+            # gate_logits: [B, H, 3] -> (TopK, Uniform, Random)
             gate_logits = self.meta_gate(read_keys) 
-            gate_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1) 
+            gate_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1) # [B, H, 3, 1]
+
             w_uniform = torch.ones_like(w_final) / self.num_slots
+            # Random noise for exploration
             w_random = F.softmax(torch.randn_like(w_final) * 5.0, dim=-1)
+
+            # Stack and mix: [B, H, 3, N]
             w_stack = torch.stack([w_final, w_uniform, w_random], dim=2)
             final_weights = (w_stack * gate_weights).sum(dim=2)
         else:
@@ -219,12 +214,17 @@ class MultiHeadMemoryBank(nn.Module):
         # 4. Retrieve Content
         read_per_head = torch.einsum('bhn,bnd->bhd', final_weights, memory)
         read_combined = self.head_merge(read_per_head.reshape(read_per_head.shape[0], -1))
+        
+        # Apply LayerNorm for signal stability
         read_combined = self.norm(read_combined)
 
-        # 5. Update Age and Hebbian Graph
+        # 5. Update Age (LRU) and Hebbian Graph
         with torch.no_grad():
             accessed_slots = mask.any(dim=1).float()
+            # Reset age for accessed slots
             self.age = self.age * (1 - accessed_slots) + accessed_slots * 0.0
+            
+        # Update graph based on what we just decided to read
         self.update_hebbian_graph(final_weights)
 
         return read_combined, final_weights
