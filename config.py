@@ -4,7 +4,7 @@ import torch
 @dataclass
 class MemoryConfig:
     # Basic Structure
-    slots: int = 128
+    slots: int = 128      # Total slots if not using split (legacy)
     dim: int = 128
     heads: int = 8
     topk: int = 16
@@ -29,8 +29,19 @@ class MemoryConfig:
     # Hebbian Graph Memory
     use_hebbian_graph: bool = True
     hebbian_lr: float = 0.05       # Learning rate for graph connections
-    hebbian_decay: float = 0.995   # Decay factor for graph edges (forgetting old links)
-    graph_influence: float = 0.2   # How much the graph affects the read operation (alpha)
+    hebbian_decay: float = 0.995   # Decay factor for graph edges
+    graph_influence: float = 0.2   # Alpha
+
+    # STM/LTM Separation
+    stm_slots: int = 64
+    ltm_slots: int = 1024
+    stm_decay_rate: float = 0.95   # Faster decay for STM (volatile)
+    ltm_decay_rate: float = 0.995  # Slower decay for LTM (stable)
+    consolidation_threshold: float = 0.1  # Transfer if utilization > threshold
+    
+    # Explicit Forgetting
+    prune_threshold: float = 0.1   # Edges below this are pruned
+    forget_rate_multiplier: float = 2.0  # Multiplier for active forget decay
 
 @dataclass
 class ModelConfig:
