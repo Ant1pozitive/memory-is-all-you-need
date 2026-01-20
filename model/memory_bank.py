@@ -66,6 +66,19 @@ class MultiHeadMemoryBank(nn.Module):
         self.hebbian_decay = hebbian_decay
         self.graph_influence = graph_influence
 
+        # Mahalanobis-like Metric Learning
+        # If enabled, we learn a transformation matrix W for the query keys.
+        # This allows the model to weight dimensions differently (feature selection).
+        self.use_learnable_metric = cfg.memory.use_learnable_metric
+        if self.use_learnable_metric:
+            # We use a Linear layer without bias as the projection matrix W
+            self.key_projector = nn.Linear(slot_dim, slot_dim, bias=False).to(cfg.device)
+            # Initialize close to Identity to start with standard cosine behavior
+            nn.init.eye_(self.key_projector.weight)
+            # Add small noise to break symmetry
+            with torch.no_grad():
+                self.key_projector.weight.add_(torch.randn_like(self.key_projector.weight) * 0.01)
+
         # Semantic Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Linear(slot_dim, bottleneck_dim),
@@ -86,22 +99,25 @@ class MultiHeadMemoryBank(nn.Module):
 
         # Decay mechanism
         self.use_decay_gate = use_decay_gate
+        self.decay_gate = nn.Parameter(torch.ones(1, device=cfg.device) * 0.99) if use_decay_gate else None
         self.decay_rate = decay_rate
-        if use_decay_gate:
-            self.decay_gate = nn.Parameter(torch.ones(1, device=cfg.device) * 0.99)
         
-        # STM/LTM params
-        self.stm_slots = cfg.memory.stm_slots if cfg else 64
-        self.ltm_slots = cfg.memory.ltm_slots if cfg else 1024
-        self.stm_decay_rate = cfg.memory.stm_decay_rate if cfg else 0.95
-        self.ltm_decay_rate = cfg.memory.ltm_decay_rate if cfg else 0.995
-        self.consolidation_threshold = cfg.memory.consolidation_threshold if cfg else 0.8
+        # STM/LTM & Consolidation params
+        self.stm_slots = cfg.memory.stm_slots
+        self.ltm_slots = cfg.memory.ltm_slots
+        self.stm_decay_rate = cfg.memory.stm_decay_rate
+        self.ltm_decay_rate = cfg.memory.ltm_decay_rate
+        
+        # Curriculum Consolidation
+        self.use_dynamic_consolidation = cfg.memory.use_dynamic_consolidation
+        self.base_consolidation_threshold = cfg.memory.consolidation_threshold
+        self.consolidation_percentile = cfg.memory.consolidation_percentile
         
         # Forgetting params
-        self.prune_threshold = cfg.memory.prune_threshold if cfg else 0.1
-        self.forget_rate_multiplier = cfg.memory.forget_rate_multiplier if cfg else 2.0
+        self.prune_threshold = cfg.memory.prune_threshold
+        self.forget_rate_multiplier = cfg.memory.forget_rate_multiplier
 
-        # STM buffers
+        # Buffers
         self.register_buffer("stm_adjacency", torch.zeros(1, self.stm_slots, self.stm_slots, device=cfg.device))
         self.register_buffer("stm_prev_access_mean", torch.zeros(1, self.stm_slots, device=cfg.device))
         self.register_buffer("stm_age", torch.zeros(1, self.stm_slots, device=cfg.device))
@@ -169,11 +185,18 @@ class MultiHeadMemoryBank(nn.Module):
         return adjacency, prev_access_mean
 
     def read(self, memory: torch.Tensor, adjacency: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1. Similarity
+        # 1. Mahalanobis-like Addressing
+        # If enabled, project keys through learned matrix W.
+        # This transforms the space before cosine similarity.
+        if self.use_learnable_metric:
+            # [B, T, D] -> [B, T, D] (projected)
+            read_keys = self.key_projector(read_keys)
+
+        # 2. Similarity
         sim = self.cosine_sim(read_keys, memory) * beta.unsqueeze(-1)
         w_base, mask = topk_sparse_softmax(sim, self.topk)
 
-        # 2. Spreading Activation via Graph
+        # 3. Spreading Activation
         if self.use_hebbian_graph:
             # Spread: [B, H, N] x [B, N, N] -> [B, H, N]
             spread_signal = torch.matmul(w_base, adjacency)
@@ -182,15 +205,15 @@ class MultiHeadMemoryBank(nn.Module):
         else:
             w_final = w_base
 
-        # 3. Meta-Policy Mixing
+        # 4. Meta-Policy
         if self.policy == "meta":
-            gate_logits = self.meta_gate(read_keys) # [B, H, 3]
+            gate_logits = self.meta_gate(read_keys)
             gate_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
 
             w_uniform = torch.ones_like(w_final) / memory.size(1)
             w_random = F.softmax(torch.randn_like(w_final) * 5.0, dim=-1)
 
-            w_stack = torch.stack([w_final, w_uniform, w_random], dim=2) # [B, H, 3, N]
+            w_stack = torch.stack([w_final, w_uniform, w_random], dim=2)
             final_weights = (w_stack * gate_weights).sum(dim=2)
         else:
             final_weights = w_final
@@ -214,10 +237,12 @@ class MultiHeadMemoryBank(nn.Module):
         # Semantic Bottleneck compression
         compressed_vals = self.bottleneck(write_vals)
         
-        # Addressing
+        # Apply metric learning to write keys too for consistency
+        if self.use_learnable_metric:
+            write_keys = self.key_projector(write_keys)
+
         sim = self.cosine_sim(write_keys, memory) * beta.unsqueeze(-1)
-        
-        # Bias towards older slots (optional LRU-like mechanism via age)
+
         age_bias = (age / (age.max() + 1e-8)).unsqueeze(1)
         sim = sim + age_bias
 
@@ -232,7 +257,7 @@ class MultiHeadMemoryBank(nn.Module):
         mem_after_erase = mem_exp * (1 - w_unsq * erase_unsq)
         
         new_memory = mem_after_erase + w_unsq * add_unsq
-        new_memory = new_memory.mean(dim=1) # Average updates from heads
+        new_memory = new_memory.mean(dim=1)
         
         # Normalize and Decay
         new_memory = F.normalize(new_memory + 1e-8, dim=-1)
@@ -248,48 +273,54 @@ class MultiHeadMemoryBank(nn.Module):
 
     def consolidate(self, stm_memory, stm_weights, ltm_memory, ltm_adjacency):
         """
-        Transfers highly utilized STM slots to LTM.
-        Replaces Least Recently Used (High Age) slots in LTM.
+        Curriculum Consolidation:
+        Dynamically adjusts the consolidation threshold based on the 'confidence' or 'load'
+        of the Short-Term Memory.
         """
         with torch.no_grad():
-            # 1. Identify important STM slots (mean attention across heads and batch)
-            stm_util = stm_weights.mean(dim=1).mean(dim=0) # [STM_Slots]
+            # Calculate mean utilization per slot across batch and heads
+            # [STM_Slots]
+            stm_util = stm_weights.mean(dim=1).mean(dim=0)
             
-            # Select candidates for consolidation
-            # E.g., take top k slots where usage > threshold
-            candidate_mask = stm_util > self.consolidation_threshold
+            # --- Dynamic Threshold Calculation ---
+            if self.use_dynamic_consolidation:
+                # Calculate the X-th percentile of utilization.
+                # Only slots exceeding this percentile are considered 'salient' enough to move to LTM.
+                # This makes the model robust: even if overall activity is low, it picks the relative best.
+                threshold = torch.quantile(stm_util, self.consolidation_percentile)
+                # Ensure threshold isn't too low (e.g. noise floor)
+                threshold = max(threshold, self.base_consolidation_threshold)
+            else:
+                threshold = self.base_consolidation_threshold
+            
+            # Select candidates
+            candidate_mask = stm_util > threshold
             if not candidate_mask.any():
                 return ltm_memory, ltm_adjacency
 
             # Get indices of important STM slots
             src_indices = torch.nonzero(candidate_mask).squeeze(1)
-            # Limit to a batch of transfers to avoid overwriting everything
+            
+            # Limit transfer size
             if len(src_indices) > 16:
                  _, top_k = torch.topk(stm_util, k=16)
                  src_indices = top_k
 
-            # 2. Identify LTM targets (Least Recently Used / Oldest)
-            # We use ltm_age to find oldest slots
+            # LTM Replacement Policy: Replace Oldest (Least Recently Used)
             ltm_age_mean = self.ltm_age.mean(dim=0)
             _, dst_indices = torch.topk(ltm_age_mean, k=len(src_indices))
             
-            # 3. Transfer Content
-            # We need to transfer for each batch item
-            # src: [B, n_trans, D], dst: [B, n_trans, D]
+            # Transfer
             transferred_content = stm_memory[:, src_indices, :]
             ltm_memory[:, dst_indices, :] = transferred_content
             
-            # 4. Reset Source STM slots (Simulate move by clearing STM)
-            # Reset to noise to allow new info
+            # Clear STM (Reset to noise)
             noise = torch.randn_like(transferred_content) * 0.01
             stm_memory[:, src_indices, :] = noise
             self.stm_age[:, src_indices] = 0
             
-            # 5. Reset LTM Age for new entries
+            # Reset LTM Age
             self.ltm_age[:, dst_indices] = 0
-            
-            # Optional: We could also transfer adjacency, but mapping indices is complex.
-            # For now, we let LTM relearn associations for new slots.
             
         return ltm_memory, ltm_adjacency
 
@@ -301,13 +332,7 @@ class MultiHeadMemoryBank(nn.Module):
         return adjacency
 
     def active_forget(self, memory: torch.Tensor, forget_mask: torch.Tensor, decay_rate: float) -> torch.Tensor:
-        """
-        Explicit Forgetting: Actively decay specific memory slots.
-        forget_mask: [B, Slots], 1 = forget, 0 = keep
-        """
-        enhanced_decay = decay_rate * (1.0 / self.forget_rate_multiplier) # Lower value = faster decay
-        
-        # Apply normal decay to kept slots, enhanced decay to forgotten slots
+        enhanced_decay = decay_rate * (1.0 / self.forget_rate_multiplier)
         decay_tensor = torch.ones_like(forget_mask) * decay_rate
         decay_tensor[forget_mask.bool()] = enhanced_decay
         

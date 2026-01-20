@@ -37,11 +37,20 @@ class MemoryConfig:
     ltm_slots: int = 1024
     stm_decay_rate: float = 0.95   # Faster decay for STM (volatile)
     ltm_decay_rate: float = 0.995  # Slower decay for LTM (stable)
-    consolidation_threshold: float = 0.1  # Transfer if utilization > threshold
+    
+    # Curriculum Consolidation
+    # If True, threshold adapts based on memory entropy/load
+    use_dynamic_consolidation: bool = True
+    consolidation_threshold: float = 0.1  # Base threshold
+    consolidation_percentile: float = 0.85 # Top % of slots to consider if dynamic
     
     # Explicit Forgetting
     prune_threshold: float = 0.1   # Edges below this are pruned
     forget_rate_multiplier: float = 2.0  # Multiplier for active forget decay
+
+    # Mahalanobis-like Addressing
+    # If True, learns a projection matrix for queries
+    use_learnable_metric: bool = True
 
 @dataclass
 class ModelConfig:

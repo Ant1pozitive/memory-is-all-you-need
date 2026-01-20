@@ -15,7 +15,7 @@ class MemNet(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Initialize the Multi-Head Memory Bank which manages both STM and LTM buffers
+        # Memory Bank init now includes new flags via 'cfg' object
         self.memory = MultiHeadMemoryBank(
             num_slots=cfg.memory.slots,
             slot_dim=cfg.memory.dim,
@@ -31,7 +31,7 @@ class MemNet(nn.Module):
             hebbian_lr=cfg.memory.hebbian_lr,
             hebbian_decay=cfg.memory.hebbian_decay,
             graph_influence=cfg.memory.graph_influence,
-            cfg=cfg 
+            cfg=cfg  # Passes use_learnable_metric and dynamic_consolidation flags
         )
 
         # Transformer-based controller to generate memory queries and actions
@@ -45,77 +45,92 @@ class MemNet(nn.Module):
         self.hallucination_head = nn.Linear(cfg.memory.dim, cfg.model.embed_dim)
 
     def forward(self, input_seq: torch.Tensor, return_attn: bool = False):
-            """
-            Processes a sequence through the controller and dual-memory system.
-            Returns logits for prediction and reconstruction for self-supervision.
-            """
-            B, T = input_seq.shape
-            device = input_seq.device
+        B, T = input_seq.shape
+        device = input_seq.device
 
-            # Initialize memory buffers for this batch
-            stm_mem, ltm_mem = self.memory.reset_memory(B, device)
-            read_vec = torch.zeros(B, self.cfg.memory.dim, device=device)
+        stm_mem, ltm_mem = self.memory.reset_memory(B, device)
+        read_vec = torch.zeros(B, self.cfg.memory.dim, device=device)
 
-            logits_list = []
-            recon_list = [] # List to store reconstruction for each time step
+        logits_list = []
+        recon_list = []
 
-            # Attention logs for visualization
-            read_weights_stm_hist = []
-            read_weights_ltm_hist = []
-            write_weights_hist = []
+        read_weights_stm_hist = []
+        read_weights_ltm_hist = []
+        write_weights_hist = []
 
-            for t in range(T):
-                current_input = input_seq[:, t:t+1]
+        for t in range(T):
+            current_input = input_seq[:, t:t+1]
 
-                # Controller generates queries based on current token and previous memory read
-                logits, read_key, write_key, write_val, erase, add_gate = self.controller(
-                    current_input, read_vec, t
+            logits, read_key, write_key, write_val, erase, add_gate = self.controller(
+                current_input, read_vec, t
+            )
+
+            # 1. READ
+            beta_r = F.softplus(self.controller.beta_read).clamp(1, 20)
+            read_stm, r_w_stm = self.memory.read(
+                stm_mem, self.memory.stm_adjacency, read_key, beta_r
+            )
+            read_ltm, r_w_ltm = self.memory.read(
+                ltm_mem, self.memory.ltm_adjacency, read_key, beta_r
+            )
+            read_vec = read_vec + (read_stm + read_ltm)
+
+            # 2. WRITE
+            beta_w = F.softplus(self.controller.beta_write).clamp(1, 20)
+            stm_mem, write_w = self.memory.write(
+                stm_mem,
+                self.memory.stm_adjacency,
+                self.memory.stm_age,
+                self.memory.stm_prev_access_mean,
+                write_key,
+                write_val,
+                erase,
+                add_gate,
+                beta_w,
+                self.memory.stm_decay_rate
+            )
+
+            # Update Graphs
+            self.memory.stm_adjacency, self.memory.stm_prev_access_mean = self.memory.update_hebbian_graph(
+                write_w, self.memory.stm_adjacency, self.memory.stm_prev_access_mean
+            )
+            self.memory.ltm_adjacency, self.memory.ltm_prev_access_mean = self.memory.update_hebbian_graph(
+                r_w_ltm, self.memory.ltm_adjacency, self.memory.ltm_prev_access_mean
+            )
+
+            # 3. CONSOLIDATION / DREAMING
+            if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
+                stm_mem = self.memory.synthesize(stm_mem)
+                
+                # Consolidate using dynamic curriculum threshold
+                ltm_mem, self.memory.ltm_adjacency = self.memory.consolidate(
+                    stm_mem, r_w_stm, ltm_mem, self.memory.ltm_adjacency
                 )
 
-                # --- Read Stage ---
-                # Extract info from both memory types in parallel
-                beta_r = F.softplus(self.controller.beta_read).clamp(1, 20)
-                read_stm, r_w_stm = self.memory.read(stm_mem, self.memory.stm_adjacency, read_key, beta_r)
-                read_ltm, r_w_ltm = self.memory.read(ltm_mem, self.memory.ltm_adjacency, read_key, beta_r)
+                self.memory.stm_adjacency = self.memory.prune_weak_edges(self.memory.stm_adjacency)
+                self.memory.ltm_adjacency = self.memory.prune_weak_edges(self.memory.ltm_adjacency)
 
-                # Update working context (read_vec)
-                read_vec = read_vec + (read_stm + read_ltm)
+                forget_mask = torch.rand(B, self.cfg.memory.stm_slots, device=device) < 0.05
+                stm_mem = self.memory.active_forget(stm_mem, forget_mask, self.memory.stm_decay_rate)
+                ltm_mem = self.memory.apply_decay(ltm_mem, self.memory.ltm_decay_rate)
 
-                # --- Write Stage ---
-                # Store current info in STM
-                beta_w = F.softplus(self.controller.beta_write).clamp(1, 20)
-                stm_mem, write_w = self.memory.write(
-                    stm_mem, self.memory.stm_adjacency, self.memory.stm_age,
-                    self.memory.stm_prev_access_mean, write_key, write_val,
-                    erase, add_gate, beta_w, self.memory.stm_decay_rate
-                )
+            # 4. RECONSTRUCTION
+            recon_vec = self.hallucination_head(read_vec)
 
-                # Periodic memory maintenance (Consolidation/Dreaming)
-                if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
-                    # Code for synthesis and STM -> LTM transfer
-                    # ... (as in previous version)
-                    pass
-
-                # --- RECONSTRUCTION HEAD ---
-                # Here we try to map the memory state back to the input embedding
-                # This 'hallucination' proves the memory actually stored the input
-                recon_step = self.hallucination_head(read_vec) # [B, Embed_dim]
-
-                logits_list.append(logits.unsqueeze(1)) # [B, 1, Vocab]
-                recon_list.append(recon_step.unsqueeze(1)) # [B, 1, Embed_dim]
-
-                if return_attn:
-                    read_weights_stm_hist.append(r_w_stm.detach().cpu())
-                    read_weights_ltm_hist.append(r_w_ltm.detach().cpu())
-                    write_weights_hist.append(write_w.detach().cpu())
-
-            # Concatenate results along the time dimension [B, T, ...]
-            logits = torch.cat(logits_list, dim=1)
-            recon = torch.cat(recon_list, dim=1)
+            logits_list.append(logits.unsqueeze(1))
+            recon_list.append(recon_vec.unsqueeze(1))
 
             if return_attn:
-                return logits, recon, \
-                    (torch.stack(read_weights_stm_hist, dim=1), torch.stack(read_weights_ltm_hist, dim=1)), \
-                    torch.stack(write_weights_hist, dim=1)
+                read_weights_stm_hist.append(r_w_stm.detach().cpu())
+                read_weights_ltm_hist.append(r_w_ltm.detach().cpu())
+                write_weights_hist.append(write_w.detach().cpu())
 
-            return logits, recon
+        logits = torch.cat(logits_list, dim=1)
+        recon = torch.cat(recon_list, dim=1)
+
+        if return_attn:
+            return logits, recon, \
+                   (torch.stack(read_weights_stm_hist, dim=1), torch.stack(read_weights_ltm_hist, dim=1)), \
+                   torch.stack(write_weights_hist, dim=1)
+
+        return logits, recon
