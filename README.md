@@ -66,15 +66,16 @@ graph TD
 
 
 * **Mahalanobis-like Addressing:**
-* The model learns a projection matrix  to transform queries. It decides *which* features matter for retrieval dynamically.
+    * The model learns a projection matrix  to transform queries. It decides *which* features matter for retrieval dynamically.
+    * Addressing is no longer fixed; the model learns its own geometry for similarity via learnable projections.
 
 
 * **Curriculum Consolidation:**
-* Instead of moving everything to LTM, the model calculates the **entropy of utilization**. Only high-salience memories are consolidated.
+    * Instead of moving everything to LTM, the model calculates the **entropy of utilization**. Only high-salience memories are consolidated.
 
 
 * **Hallucination Loss:**
-* A self-supervised objective where the model must reconstruct the original input from its memory state alone.
+    * A self-supervised objective where the model must reconstruct the original input from its memory state alone.
 
 
 
@@ -139,6 +140,28 @@ cfg.memory.use_dynamic_consolidation = True
 cfg.memory.stm_slots = 64
 cfg.memory.ltm_slots = 1024
 ```
+
+---
+
+## 🗺 Roadmap: The Path to Cognitive Autonomy
+
+We view this project as an evolving entity. Our goal is to move from "Memory as a Buffer" to "Memory as a Processor".
+
+### Phase 1: Foundations (Current) ✅
+* [x] **Dual-Store Mechanism:** Implementation of STM/LTM separation.
+* [x] **Active Consolidation:** Curriculum-based transfer from short-term to long-term.
+* [x] **Learnable Metric Addressing:** Moving beyond Cosine Similarity to Mahalanobis-like projections.
+* [x] **Hallucination Loss:** Self-supervised verification of memory content.
+
+### Phase 2: Cognitive Refinement (Next Steps) 🏗
+* [ ] **Uncertainty-Aware Read:** Implement a "Confidence Head" that tells the model when to trust its memory and when to "explore".
+* [ ] **Functional Specialization:** Train memory heads to specialize (e.g., Head 1 for Temporal order, Head 2 for Semantic content).
+* [ ] **Adaptive Decay:** Slots forget not just by time, but by their "Surprise" value or "Utility" score.
+
+### Phase 3: Generative Dreaming & Planning 🚀
+* [ ] **Generative Replay:** Replacing random noise synthesis with a small internal world model that predicts future states.
+* [ ] **Multimodal Slots:** Extending memory slots to store cross-modal embeddings (Text + Image features).
+* [ ] **Zero-Shot Task Switching:** Testing memory stability across radically different algorithmic tasks without catastrophic forgetting.
 
 ---
 
