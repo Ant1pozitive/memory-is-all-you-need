@@ -4,13 +4,12 @@ import torch
 @dataclass
 class MemoryConfig:
     # Basic Structure
-    slots: int = 128      # Total slots if not using split (legacy)
+    slots: int = 128
     dim: int = 128
     heads: int = 8
     topk: int = 16
     
     # Policies
-    # "meta" enables the dynamic mixing of Top-K, Uniform, and Random strategies
     policy: str = "meta"  
     
     # Decay & Age
@@ -24,33 +23,37 @@ class MemoryConfig:
     # Neural Synthesis (Dreaming)
     n_synthesis_layers: int = 2
     synthesis_heads: int = 4
-    synthesis_interval: int = 4  # Run synthesis every N steps
+    synthesis_interval: int = 4
     
-    # Hebbian Graph Memory
+    # Hebbian Graph Memory & Topological Dynamics
     use_hebbian_graph: bool = True
-    hebbian_lr: float = 0.05       # Learning rate for graph connections
-    hebbian_decay: float = 0.995   # Decay factor for graph edges
-    graph_influence: float = 0.2   # Alpha
-
+    hebbian_lr: float = 0.05
+    hebbian_decay: float = 0.995
+    
+    # Topological Memory
+    # Number of hops for activation spreading (A -> B -> C)
+    spreading_steps: int = 2  
+    # How much the graph structure influences retrieval vs raw content
+    graph_influence: float = 0.3 
+    
     # STM/LTM Separation
     stm_slots: int = 64
     ltm_slots: int = 1024
-    stm_decay_rate: float = 0.95   # Faster decay for STM (volatile)
-    ltm_decay_rate: float = 0.995  # Slower decay for LTM (stable)
+    stm_decay_rate: float = 0.95
+    ltm_decay_rate: float = 0.995
     
     # Curriculum Consolidation
-    # If True, threshold adapts based on memory entropy/load
     use_dynamic_consolidation: bool = True
-    consolidation_threshold: float = 0.1  # Base threshold
-    consolidation_percentile: float = 0.85 # Top % of slots to consider if dynamic
+    consolidation_threshold: float = 0.1
+    consolidation_percentile: float = 0.85
     
     # Explicit Forgetting
-    prune_threshold: float = 0.1   # Edges below this are pruned
-    forget_rate_multiplier: float = 2.0  # Multiplier for active forget decay
-
-    # Mahalanobis-like Addressing
-    # If True, learns a projection matrix for queries
-    use_learnable_metric: bool = True
+    prune_threshold: float = 0.1
+    forget_rate_multiplier: float = 2.0
+    
+    # Context-Dependent Distance Learning
+    # If True, computes dynamic feature weights based on query context
+    use_context_metric: bool = True
 
 @dataclass
 class ModelConfig:
@@ -77,7 +80,10 @@ class TrainConfig:
     lambda_sparsity: float = 0.02
     lambda_diversity: float = 0.01
     lambda_utilization: float = 0.01
-    lambda_hallucination: float = 0.1  # Reconstruction loss weight
+    lambda_hallucination: float = 0.1
+    
+    # Graph Regularization: Penalizes dense graphs to encourage sparse topology
+    lambda_graph_sparsity: float = 0.005
     
     patience: int = 10
     use_wandb: bool = False

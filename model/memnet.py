@@ -6,16 +6,10 @@ from .controller import TransformerController
 
 
 class MemNet(nn.Module):
-    """
-    MemNet: A Dual-Memory Neural Architecture.
-    Combines a Transformer controller with an active Short-Term Memory (STM) 
-    and a stable Long-Term Memory (LTM).
-    """
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
 
-        # Memory Bank init now includes new flags via 'cfg' object
         self.memory = MultiHeadMemoryBank(
             num_slots=cfg.memory.slots,
             slot_dim=cfg.memory.dim,
@@ -31,17 +25,15 @@ class MemNet(nn.Module):
             hebbian_lr=cfg.memory.hebbian_lr,
             hebbian_decay=cfg.memory.hebbian_decay,
             graph_influence=cfg.memory.graph_influence,
-            cfg=cfg  # Passes use_learnable_metric and dynamic_consolidation flags
+            cfg=cfg 
         )
 
-        # Transformer-based controller to generate memory queries and actions
         self.controller = TransformerController(
             cfg.model.vocab_size, cfg.model.embed_dim, cfg.model.hidden_dim,
             cfg.memory.dim, cfg.memory.heads, cfg.model.num_layers,
             cfg.model.num_heads_attn, cfg.model.max_seq_len
         )
 
-        # Head for reconstructing input from memory (Hallucination/Self-Supervision)
         self.hallucination_head = nn.Linear(cfg.memory.dim, cfg.model.embed_dim)
 
     def forward(self, input_seq: torch.Tensor, return_attn: bool = False):
@@ -102,7 +94,6 @@ class MemNet(nn.Module):
             if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
                 stm_mem = self.memory.synthesize(stm_mem)
                 
-                # Consolidate using dynamic curriculum threshold
                 ltm_mem, self.memory.ltm_adjacency = self.memory.consolidate(
                     stm_mem, r_w_stm, ltm_mem, self.memory.ltm_adjacency
                 )
@@ -127,10 +118,14 @@ class MemNet(nn.Module):
 
         logits = torch.cat(logits_list, dim=1)
         recon = torch.cat(recon_list, dim=1)
+        
+        # Return Adjacency matrices for Graph Regularization Loss
+        # We return the final state of adjacency for this batch
+        adj_tuple = (self.memory.stm_adjacency, self.memory.ltm_adjacency)
 
         if return_attn:
             return logits, recon, \
                    (torch.stack(read_weights_stm_hist, dim=1), torch.stack(read_weights_ltm_hist, dim=1)), \
-                   torch.stack(write_weights_hist, dim=1)
+                   torch.stack(write_weights_hist, dim=1), adj_tuple
 
-        return logits, recon
+        return logits, recon, adj_tuple
