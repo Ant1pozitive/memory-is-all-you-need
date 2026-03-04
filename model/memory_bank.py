@@ -83,6 +83,7 @@ class MultiHeadMemoryBank(nn.Module):
                  hebbian_decay: float = 0.995, graph_influence: float = 0.3, cfg=None):
         super().__init__()
         
+        self.cfg = cfg
         self.slot_dim = slot_dim
         self.n_heads = n_heads
         self.topk = topk
@@ -296,7 +297,7 @@ class MultiHeadMemoryBank(nn.Module):
             if self.cfg.memory.use_entropy_utilization:
                 p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)
                 entropy = - (p * torch.log(p + 1e-8)).sum(-1)
-                utilization = stm_util * (1 - entropy / torch.log(torch.tensor(stm_weights.shape[-1])))
+                utilization = stm_util * (1 - entropy / torch.log(torch.tensor(stm_weights.shape[-1], device=stm_weights.device)))
             else:
                 utilization = stm_util
 
