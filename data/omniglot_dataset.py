@@ -1,22 +1,25 @@
-from .base import TaskDataset
+from torch.utils.data import Dataset
 import numpy as np
 import torch
-# Note: For simplicity, simulate Omniglot as few-shot classification toy (no real images)
+from .base import TaskDataset
 
 class OmniglotDataset(TaskDataset):
-    """Simulated few-shot Omniglot: Present K classes, N shots, query."""
-    def __init__(self, vocab_size, num_classes=5, shots=1, query_len=1):
-        super().__init__(vocab_size)
-        self.num_classes = num_classes
-        self.shots = shots
-        self.query_len = query_len
-        self.delim = vocab_size - 1
+    """Simulated Omniglot few-shot continual classification."""
+    def __init__(self, cfg, split: str = 'train'):
+        super().__init__(cfg.model.vocab_size)
+        self.num_classes = cfg.task.num_classes
+        self.shots = 5
+        self.query_len = 3
+        self.size = 5000 if split == 'train' else 500
 
-    def __next__(self):
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
         labels = np.arange(self.num_classes)
         np.random.shuffle(labels)
         support = np.repeat(labels, self.shots)
         query_labels = np.random.choice(labels, self.query_len)
-        input_seq = np.concatenate([support, [self.delim], query_labels * 0])  # placeholders for features
+        input_seq = np.concatenate([support, [self.delim], query_labels * 0])
         target = np.concatenate([np.full(len(support) + 1, -100), query_labels])
         return torch.from_numpy(input_seq).long(), torch.from_numpy(target).long()
