@@ -74,6 +74,10 @@ graph TD
     * Instead of moving everything to LTM, the model calculates the **entropy of utilization**. Only high-salience memories are consolidated.
 
 
+* **Uncertainty-Aware Read:**
+    * Confidence head predicts how much to trust STM vs LTM read. Low entropy = high confidence.
+
+
 * **Hallucination Loss:**
     * A self-supervised objective where the model must reconstruct the original input from its memory state alone.
 
@@ -117,10 +121,18 @@ jupyter notebook demo_comparison.ipynb
 
 ### Training
 
-Train the full model on the algorithmic Copy Task with long delays:
+Train the full model on any task:
 
 ```bash
-python train.py --config config.py
+python train.py --task copy
+python train.py --task associative
+python train.py --task omniglot
+```
+
+For DDP:
+
+```bash
+torchrun --nproc_per_node=2 train.py --task copy --ddp
 ```
 
 ---
@@ -130,15 +142,11 @@ python train.py --config config.py
 You can toggle the cognitive modules in `config.py`:
 
 ```python
-# Enable learnable metric (Mahalanobis)
-cfg.memory.use_learnable_metric = True 
+# Enable Uncertainty-Aware Read
+cfg.memory.use_uncertainty_aware_read = True
 
-# Enable adaptive thresholding for consolidation
-cfg.memory.use_dynamic_consolidation = True 
-
-# Set memory pressure
-cfg.memory.stm_slots = 64
-cfg.memory.ltm_slots = 1024
+# Enable entropy-based consolidation
+cfg.memory.use_entropy_utilization = True
 ```
 
 ---
@@ -147,21 +155,21 @@ cfg.memory.ltm_slots = 1024
 
 We view this project as an evolving entity. Our goal is to move from "Memory as a Buffer" to "Memory as a Processor".
 
-### Phase 1: Foundations (Current) ✅
-* [x] **Dual-Store Mechanism:** Implementation of STM/LTM separation.
-* [x] **Active Consolidation:** Curriculum-based transfer from short-term to long-term.
-* [x] **Learnable Metric Addressing:** Moving beyond Cosine Similarity to Mahalanobis-like projections.
-* [x] **Hallucination Loss:** Self-supervised verification of memory content.
+### Phase 1: Foundations ✅
+* [x] **Dual-Store Mechanism**
+* [x] **Active Consolidation**
+* [x] **Learnable Metric Addressing**
+* [x] **Hallucination Loss**
 
-### Phase 2: Cognitive Refinement (Next Steps) 🏗
-* [ ] **Uncertainty-Aware Read:** Implement a "Confidence Head" that tells the model when to trust its memory and when to "explore".
-* [ ] **Functional Specialization:** Train memory heads to specialize (e.g., Head 1 for Temporal order, Head 2 for Semantic content).
-* [ ] **Adaptive Decay:** Slots forget not just by time, but by their "Surprise" value or "Utility" score.
+### Phase 2: Cognitive Refinement ✅
+* [x] **Uncertainty-Aware Read:** Confidence head + dynamic STM/LTM fusion.
+* [x] **Entropy Utilization** in consolidation.
+* [x] **torch.compile + DDP** support + multi-task continual learning.
 
 ### Phase 3: Generative Dreaming & Planning 🚀
-* [ ] **Generative Replay:** Replacing random noise synthesis with a small internal world model that predicts future states.
-* [ ] **Multimodal Slots:** Extending memory slots to store cross-modal embeddings (Text + Image features).
-* [ ] **Zero-Shot Task Switching:** Testing memory stability across radically different algorithmic tasks without catastrophic forgetting.
+* [ ] **Generative Replay:** Replacing random noise synthesis with a small internal world model...
+* [ ] **Multimodal Slots**
+* [ ] **Zero-Shot Task Switching**
 
 ---
 
@@ -171,8 +179,7 @@ This is an **experimental research codebase**.
 The goal is insight, not just benchmark chasing.
 
 Expect:
-
-* Clean abstractions (`MemoryBank`, `Controller`)
+* Clean abstractions
 * Extensive logging and visualization tools
 * Code that prioritizes readability over hyper-optimization
 
