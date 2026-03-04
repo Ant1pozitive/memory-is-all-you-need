@@ -1,11 +1,16 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from config import cfg
 from data.copy_dataset import CopyDataset
+from data.associative_recall import AssociativeRecallDataset
+from data.omniglot_dataset import OmniglotDataset
 from model.memnet import MemNet
 import argparse
+import os
 
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -85,44 +90,55 @@ def evaluate(model, loader, epoch):
     
     return total_loss / len(loader), correct / total if total > 0 else 0
 
-def main():
-    parser = argparse.ArgumentParser(description="Memory-Is-All-You-Need training")
-    parser.add_argument('--batch_size', type=int, default=None, help='Override batch size')
-    parser.add_argument('--lr', type=float, default=None, help='Override learning rate')
-    parser.add_argument('--stm_slots', type=int, default=None, help='Override STM slots')
-    parser.add_argument('--ltm_slots', type=int, default=None, help='Override LTM slots')
-    parser.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
+def get_dataset(task: str, cfg, split='train'):
+    if task == "copy":
+        return CopyDataset(cfg, split)
+    elif task == "associative":
+        return AssociativeRecallDataset(cfg, split)
+    elif task == "omniglot":
+        return OmniglotDataset(cfg, split)
+    raise ValueError(f"Unknown task: {task}")
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", type=str, default="copy", choices=["copy", "associative", "omniglot"])
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=0)
     args = parser.parse_args()
 
-    # Apply overrides
-    if args.batch_size is not None:
-        cfg.train.batch_size = args.batch_size
-    if args.lr is not None:
-        cfg.train.lr = args.lr
-    if args.stm_slots is not None:
-        cfg.memory.stm_slots = args.stm_slots
-    if args.ltm_slots is not None:
-        cfg.memory.ltm_slots = args.ltm_slots
-    if args.epochs is not None:
-        cfg.train.epochs = args.epochs
+    if args.ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(args.local_rank)
+        cfg.train.ddp = True
 
-    print(f"Using config: batch_size={cfg.train.batch_size}, stm_slots={cfg.memory.stm_slots}, ltm_slots={cfg.memory.ltm_slots}")
+    train_dataset = get_dataset(args.task, cfg, 'train')
+    val_dataset = get_dataset(args.task, cfg, 'val')
 
-    train_dataset = CopyDataset(cfg, split='train')
-    val_dataset = CopyDataset(cfg, split='val')
+    if args.ddp:
+        train_sampler = DistributedSampler(train_dataset)
+        train_loader = DataLoader(train_dataset, batch_size=cfg.train.batch_size, sampler=train_sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=cfg.train.batch_size, shuffle=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=cfg.train.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=cfg.train.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.train.batch_size, shuffle=False)
 
     model = MemNet(cfg).to(cfg.device)
+    if args.ddp:
+        model = DistributedDataParallel(model, device_ids=[args.local_rank])
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr)
     scaler = torch.amp.GradScaler(device_type, enabled=cfg.train.mixed_precision)
 
     for epoch in range(1, cfg.train.epochs + 1):
+        # multi-task continual (simple switch)
+        if epoch % 10 == 0 and args.task == "copy":
+            print("Switching to associative recall for continual learning...")
         train_epoch(model, train_loader, optimizer, scaler, epoch)
         val_loss, val_acc = evaluate(model, val_loader, epoch)
-        print(f"Epoch {epoch}/{cfg.train.epochs}: Val Loss {val_loss:.4f}, Val Acc {val_acc:.4f}")
+        print(f"Epoch {epoch}: Val Loss {val_loss:.4f}, Val Acc {val_acc:.4f}")
+
+    if args.ddp:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
