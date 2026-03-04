@@ -31,14 +31,12 @@ class MemoryConfig:
     hebbian_decay: float = 0.995
     
     # Topological Memory
-    # Number of hops for activation spreading (A -> B -> C)
-    spreading_steps: int = 2  
-    # How much the graph structure influences retrieval vs raw content
+    spreading_steps: int = 2
     graph_influence: float = 0.3 
     
     # STM/LTM Separation
     stm_slots: int = 64
-    ltm_slots: int = 1024
+    ltm_slots: int = 512
     stm_decay_rate: float = 0.95
     ltm_decay_rate: float = 0.995
     
@@ -52,8 +50,16 @@ class MemoryConfig:
     forget_rate_multiplier: float = 2.0
     
     # Context-Dependent Distance Learning
-    # If True, computes dynamic feature weights based on query context
     use_context_metric: bool = True
+
+    # Uncertainty-Aware Read
+    use_uncertainty_aware_read: bool = True
+    uncertainty_alpha: float = 0.7          # weight of confidence in STM/LTM fusion
+    entropy_temperature: float = 0.1        # for entropy calculation
+
+    # Entropy Utilization in consolidation
+    use_entropy_utilization: bool = True
+    min_entropy_threshold: float = 0.5
 
 @dataclass
 class ModelConfig:
@@ -68,10 +74,12 @@ class ModelConfig:
 class TaskConfig:
     seq_len: int = 10
     delay_len: int = 100
+    num_pairs: int = 5          # for associative recall
+    num_classes: int = 5        # for omniglot
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 32
+    batch_size: int = 16
     lr: float = 1e-4
     epochs: int = 50
     grad_clip: float = 1.0
@@ -81,13 +89,19 @@ class TrainConfig:
     lambda_diversity: float = 0.01
     lambda_utilization: float = 0.01
     lambda_hallucination: float = 0.1
-    
-    # Graph Regularization: Penalizes dense graphs to encourage sparse topology
     lambda_graph_sparsity: float = 0.005
+    
+    # Uncertainty loss
+    lambda_uncertainty: float = 0.05
     
     patience: int = 10
     use_wandb: bool = False
     mixed_precision: bool = True
+    
+    # torch.compile + DDP
+    use_compile: bool = True
+    ddp: bool = False
+    world_size: int = 1
 
 @dataclass
 class BaseConfig:
