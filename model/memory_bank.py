@@ -135,6 +135,9 @@ class MultiHeadMemoryBank(nn.Module):
         self.register_buffer("ltm_prev_access_mean", torch.zeros(1, self.ltm_slots, device=cfg.device))
         self.register_buffer("ltm_age", torch.zeros(1, self.ltm_slots, device=cfg.device))
 
+        self.read_head_merge = nn.Linear(n_heads * slot_dim, slot_dim).to(cfg.device)
+        self.read_norm = nn.LayerNorm(slot_dim).to(cfg.device)
+
     def reset_memory(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         self.stm_age = torch.zeros(batch_size, self.stm_slots, device=device)
         self.stm_adjacency = torch.zeros(batch_size, self.stm_slots, self.stm_slots, device=device)
@@ -230,9 +233,7 @@ class MultiHeadMemoryBank(nn.Module):
 
         # 5. Retrieve
         read_per_head = torch.einsum('bhn,bnd->bhd', final_weights, memory)
-        head_merge = nn.Linear(self.n_heads * self.slot_dim, self.slot_dim, device=memory.device)
-        norm = nn.LayerNorm(self.slot_dim, device=memory.device)
-        read_combined = norm(head_merge(read_per_head.reshape(read_per_head.shape[0], -1)))
+        read_combined = self.read_norm(self.read_head_merge(read_per_head.reshape(read_per_head.shape[0], -1)))
 
         return read_combined, final_weights
 
@@ -324,6 +325,6 @@ class MultiHeadMemoryBank(nn.Module):
 
     def active_forget(self, memory: torch.Tensor, forget_mask: torch.Tensor, decay_rate: float) -> torch.Tensor:
         enhanced_decay = decay_rate * (1.0 / self.forget_rate_multiplier)
-        decay_tensor = torch.ones_like(forget_mask) * decay_rate
+        decay_tensor = torch.ones_like(forget_mask, dtype=memory.dtype, device=memory.device) * decay_rate
         decay_tensor[forget_mask.bool()] = enhanced_decay
         return memory * decay_tensor.unsqueeze(-1)
