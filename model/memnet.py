@@ -48,6 +48,13 @@ class MemNet(nn.Module):
 
         logits_list = []
         recon_list = []
+        
+        # Collect for train.py losses
+        read_w_stm_list = []
+        read_w_ltm_list = []
+        write_w_list = []
+        adj_stm_list = []
+        adj_ltm_list = []
 
         for t in range(T):
             current_input = input_seq[:, t:t+1]
@@ -103,11 +110,24 @@ class MemNet(nn.Module):
 
             logits_list.append(logits.unsqueeze(1))
             recon_list.append(recon_vec.unsqueeze(1))
+            
+            # Collect for return_attn
+            read_w_stm_list.append(r_w_stm.unsqueeze(1))
+            read_w_ltm_list.append(r_w_ltm.unsqueeze(1))
+            write_w_list.append(write_w.unsqueeze(1))
+            adj_stm_list.append(self.memory.stm_adjacency.unsqueeze(1))
+            adj_ltm_list.append(self.memory.ltm_adjacency.unsqueeze(1))
 
         logits = torch.cat(logits_list, dim=1)
         recon = torch.cat(recon_list, dim=1)
         
         if return_attn:
-            return logits, recon, None, None, None  # simplified for now
+            return (
+                logits,
+                recon,
+                (torch.cat(read_w_stm_list, dim=1), torch.cat(read_w_ltm_list, dim=1)),
+                torch.cat(write_w_list, dim=1),
+                (torch.cat(adj_stm_list, dim=1), torch.cat(adj_ltm_list, dim=1))
+            )
 
         return logits, recon, None
