@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,17 +13,13 @@ def topk_sparse_softmax(sim: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.
     """
     B, H, N = sim.shape
     sim_flat = sim.view(B * H, N)
-    
     _, idx = torch.topk(sim_flat, k=min(k, N), dim=-1)
-    
     mask = torch.zeros_like(sim_flat, dtype=torch.bool)
     arange = torch.arange(B * H, device=sim.device).unsqueeze(1)
     mask[arange, idx] = True
     mask = mask.view(B, H, N)
-    
     masked_sim = sim.masked_fill(~mask, float('-inf'))
     weights = F.softmax(masked_sim, dim=-1)
-    
     return weights, mask
 
 class MemorySynthesizer(nn.Module):
@@ -41,7 +37,6 @@ class MemorySynthesizer(nn.Module):
     def forward(self, memory: torch.Tensor) -> torch.Tensor:
         return self.transformer(memory)
 
-
 class ContextWeightingNetwork(nn.Module):
     """
     Learns to assign importance weights to memory dimensions based on the query context.
@@ -58,9 +53,27 @@ class ContextWeightingNetwork(nn.Module):
         )
     
     def forward(self, query: torch.Tensor) -> torch.Tensor:
-        # Scale sigmoid to [0, 2] to allow both suppression and enhancement
         return self.net(query) * 2.0
 
+class ConfidenceHead(nn.Module):
+    """
+    Uncertainty-Aware Read
+    Predicts confidence [0,1] from read keys.
+    Low entropy of attention = high confidence.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.ReLU(),
+            nn.Linear(dim // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, read_keys: torch.Tensor) -> torch.Tensor:
+        # Average over heads -> [B, D]
+        x = read_keys.mean(dim=1)
+        return self.net(x).squeeze(-1)
 
 class MultiHeadMemoryBank(nn.Module):
     def __init__(self, num_slots: int, slot_dim: int, n_heads: int = 8, topk: int = 16,
@@ -126,6 +139,11 @@ class MultiHeadMemoryBank(nn.Module):
         self.prune_threshold = cfg.memory.prune_threshold
         self.forget_rate_multiplier = cfg.memory.forget_rate_multiplier
 
+        # Uncertainty-Aware Read
+        self.use_uncertainty_aware_read = cfg.memory.use_uncertainty_aware_read
+        if self.use_uncertainty_aware_read:
+            self.confidence_head = ConfidenceHead(slot_dim).to(cfg.device)
+
         # Buffers
         self.register_buffer("stm_adjacency", torch.zeros(1, self.stm_slots, self.stm_slots, device=cfg.device))
         self.register_buffer("stm_prev_access_mean", torch.zeros(1, self.stm_slots, device=cfg.device))
@@ -166,54 +184,37 @@ class MultiHeadMemoryBank(nn.Module):
     def update_hebbian_graph(self, current_weights: torch.Tensor, adjacency: torch.Tensor, prev_access_mean: torch.Tensor):
         if not self.use_hebbian_graph:
             return adjacency, prev_access_mean
-
         with torch.no_grad():
             curr_act = current_weights.mean(dim=1)
             hebbian_update = torch.bmm(prev_access_mean.unsqueeze(2), curr_act.unsqueeze(1))
             adjacency = (adjacency * self.hebbian_decay) + (self.hebbian_lr * hebbian_update)
             adjacency = torch.clamp(adjacency, max=1.0)
             prev_access_mean = curr_act.detach()
-        
         return adjacency, prev_access_mean
 
-    def read(self, memory: torch.Tensor, adjacency: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def read(self, memory: torch.Tensor, adjacency: torch.Tensor, read_keys: torch.Tensor, beta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Context-Dependent Metric Learning
-        # Instead of static cosine similarity, we weight features dynamically based on the query.
         if self.use_context_metric:
-            # Generate feature importance weights: [B, H, D]
             feature_weights = self.context_weigher(read_keys)
-            
-            # Apply weights to query keys: [B, H, D]
             weighted_keys = read_keys * feature_weights
-            
-            # Apply weights to memory: [B, 1, N, D] * [B, H, 1, D] -> [B, H, N, D]
-            # We treat each head's context differently for the same memory slots
             weighted_memory = memory.unsqueeze(1) * feature_weights.unsqueeze(2)
-            
-            # Compute Cosine Sim on weighted vectors
             k_norm = F.normalize(weighted_keys, dim=-1)
             m_norm = F.normalize(weighted_memory, dim=-1)
             sim = torch.einsum('bhd,bhnd->bhn', k_norm, m_norm) * beta.unsqueeze(-1)
         else:
-            # Standard Cosine
             k_norm = F.normalize(read_keys, dim=-1)
             m_norm = F.normalize(memory, dim=-1)
             sim = torch.einsum('bhd,bnd->bhn', k_norm, m_norm) * beta.unsqueeze(-1)
 
-        # 2. Content Addressing (Top-K)
+        # 2. Content Addressing
         w_content, _ = topk_sparse_softmax(sim, self.topk)
 
-        # 3. Topological Memory: Spreading Activation
-        # Activation flows through the graph: w(t+1) = w(t) * Adjacency
+        # 3. Spreading Activation
         if self.use_hebbian_graph:
             w_current = w_content
             for _ in range(self.spreading_steps):
-                # Spread: [B, H, N] x [B, N, N] -> [B, H, N]
                 spread_signal = torch.matmul(w_current, adjacency)
-                # Combine original activation with spread signal
                 w_current = w_current + (self.graph_influence * spread_signal)
-            
-            # Re-normalize to ensure valid probability distribution
             w_final = w_current / (w_current.sum(dim=-1, keepdim=True) + 1e-8)
         else:
             w_final = w_content
@@ -222,10 +223,8 @@ class MultiHeadMemoryBank(nn.Module):
         if self.policy == "meta":
             gate_logits = self.meta_gate(read_keys)
             gate_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
-
             w_uniform = torch.ones_like(w_final) / memory.size(1)
             w_random = F.softmax(torch.randn_like(w_final) * 5.0, dim=-1)
-
             w_stack = torch.stack([w_final, w_uniform, w_random], dim=2)
             final_weights = (w_stack * gate_weights).sum(dim=2)
         else:
@@ -235,22 +234,24 @@ class MultiHeadMemoryBank(nn.Module):
         read_per_head = torch.einsum('bhn,bnd->bhd', final_weights, memory)
         read_combined = self.read_norm(self.read_head_merge(read_per_head.reshape(read_per_head.shape[0], -1)))
 
-        return read_combined, final_weights
+        # Uncertainty-Aware Read
+        confidence = torch.ones(read_combined.shape[0], device=read_combined.device)
+        if self.use_uncertainty_aware_read:
+            confidence = self.confidence_head(read_keys)
+
+        return read_combined, final_weights, confidence
 
     def write(self, memory: torch.Tensor, adjacency: torch.Tensor, age: torch.Tensor, prev_access_mean: torch.Tensor,
               write_keys: torch.Tensor, write_vals: torch.Tensor, erase: torch.Tensor, add_gate: torch.Tensor, beta: torch.Tensor, decay_rate: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        
         with torch.no_grad():
             age += 1.0
 
         compressed_vals = self.bottleneck(write_vals)
         
-        # Apply metric learning to write keys too for consistency
         if self.use_context_metric:
             feature_weights = self.context_weigher(write_keys)
             weighted_keys = write_keys * feature_weights
             weighted_memory = memory.unsqueeze(1) * feature_weights.unsqueeze(2)
-            
             k_norm = F.normalize(weighted_keys, dim=-1)
             m_norm = F.normalize(weighted_memory, dim=-1)
             sim = torch.einsum('bhd,bhnd->bhn', k_norm, m_norm) * beta.unsqueeze(-1)
@@ -273,7 +274,6 @@ class MultiHeadMemoryBank(nn.Module):
         
         new_memory = mem_after_erase + w_unsq * add_unsq
         new_memory = new_memory.mean(dim=1)
-        
         new_memory = F.normalize(new_memory + 1e-8, dim=-1)
         new_memory = self.apply_decay(new_memory, decay_rate)
 
@@ -284,24 +284,33 @@ class MultiHeadMemoryBank(nn.Module):
         return new_memory, weights
 
     def consolidate(self, stm_memory, stm_weights, ltm_memory, ltm_adjacency):
+        """
+        Entropy utilization + top-percentile only.
+        High entropy = poor utilization -> do NOT transfer.
+        """
         with torch.no_grad():
+            # Base utility
             stm_util = stm_weights.mean(dim=1).mean(dim=0)
             
-            if self.use_dynamic_consolidation:
-                threshold = torch.quantile(stm_util, self.consolidation_percentile)
-                threshold = max(threshold, self.base_consolidation_threshold)
+            # Entropy utilization
+            if self.cfg.memory.use_entropy_utilization:
+                p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)
+                entropy = - (p * torch.log(p + 1e-8)).sum(-1)
+                utilization = stm_util * (1 - entropy / torch.log(torch.tensor(stm_weights.shape[-1])))
             else:
-                threshold = self.base_consolidation_threshold
+                utilization = stm_util
+
+            threshold = torch.quantile(utilization, self.consolidation_percentile)
+            threshold = max(threshold, self.base_consolidation_threshold)
             
-            candidate_mask = stm_util > threshold
+            candidate_mask = utilization > threshold
             if not candidate_mask.any():
                 return ltm_memory, ltm_adjacency
 
             src_indices = torch.nonzero(candidate_mask).squeeze(1)
-            
             if len(src_indices) > 16:
-                 _, top_k = torch.topk(stm_util, k=16)
-                 src_indices = top_k
+                _, top_k = torch.topk(utilization, k=16)
+                src_indices = top_k
 
             ltm_age_mean = self.ltm_age.mean(dim=0)
             _, dst_indices = torch.topk(ltm_age_mean, k=len(src_indices))
@@ -312,7 +321,6 @@ class MultiHeadMemoryBank(nn.Module):
             noise = torch.randn_like(transferred_content) * 0.01
             stm_memory[:, src_indices, :] = noise
             self.stm_age[:, src_indices] = 0
-            
             self.ltm_age[:, dst_indices] = 0
             
         return ltm_memory, ltm_adjacency
