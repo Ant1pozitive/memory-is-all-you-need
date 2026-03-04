@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from .memory_bank import MultiHeadMemoryBank
 from .controller import TransformerController
 
-
 class MemNet(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -36,6 +35,10 @@ class MemNet(nn.Module):
 
         self.hallucination_head = nn.Linear(cfg.memory.dim, cfg.model.embed_dim)
 
+        # torch.compile compatibility
+        if cfg.train.use_compile and torch.__version__ >= "2.0":
+            self = torch.compile(self, mode="reduce-overhead")
+
     def forward(self, input_seq: torch.Tensor, return_attn: bool = False):
         B, T = input_seq.shape
         device = input_seq.device
@@ -46,10 +49,6 @@ class MemNet(nn.Module):
         logits_list = []
         recon_list = []
 
-        read_weights_stm_hist = []
-        read_weights_ltm_hist = []
-        write_weights_hist = []
-
         for t in range(T):
             current_input = input_seq[:, t:t+1]
 
@@ -57,29 +56,25 @@ class MemNet(nn.Module):
                 current_input, read_vec, t
             )
 
-            # 1. READ
+            # 1. READ with Uncertainty
             beta_r = F.softplus(self.controller.beta_read).clamp(1, 20)
-            read_stm, r_w_stm = self.memory.read(
+            read_stm, r_w_stm, conf_stm = self.memory.read(
                 stm_mem, self.memory.stm_adjacency, read_key, beta_r
             )
-            read_ltm, r_w_ltm = self.memory.read(
+            read_ltm, r_w_ltm, conf_ltm = self.memory.read(
                 ltm_mem, self.memory.ltm_adjacency, read_key, beta_r
             )
-            read_vec = read_vec + (read_stm + read_ltm)
+
+            # Uncertainty-aware fusion
+            conf = (conf_stm + conf_ltm) / 2
+            read_vec = read_vec + (conf.unsqueeze(1) * read_stm + (1 - conf.unsqueeze(1)) * read_ltm)
 
             # 2. WRITE
             beta_w = F.softplus(self.controller.beta_write).clamp(1, 20)
             stm_mem, write_w = self.memory.write(
-                stm_mem,
-                self.memory.stm_adjacency,
-                self.memory.stm_age,
-                self.memory.stm_prev_access_mean,
-                write_key,
-                write_val,
-                erase,
-                add_gate,
-                beta_w,
-                self.memory.stm_decay_rate
+                stm_mem, self.memory.stm_adjacency, self.memory.stm_age,
+                self.memory.stm_prev_access_mean, write_key, write_val,
+                erase, add_gate, beta_w, self.memory.stm_decay_rate
             )
 
             # Update Graphs
@@ -93,11 +88,9 @@ class MemNet(nn.Module):
             # 3. CONSOLIDATION / DREAMING
             if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
                 stm_mem = self.memory.synthesize(stm_mem)
-                
                 ltm_mem, self.memory.ltm_adjacency = self.memory.consolidate(
                     stm_mem, r_w_stm, ltm_mem, self.memory.ltm_adjacency
                 )
-
                 self.memory.stm_adjacency = self.memory.prune_weak_edges(self.memory.stm_adjacency)
                 self.memory.ltm_adjacency = self.memory.prune_weak_edges(self.memory.ltm_adjacency)
 
@@ -111,21 +104,10 @@ class MemNet(nn.Module):
             logits_list.append(logits.unsqueeze(1))
             recon_list.append(recon_vec.unsqueeze(1))
 
-            if return_attn:
-                read_weights_stm_hist.append(r_w_stm.detach().cpu())
-                read_weights_ltm_hist.append(r_w_ltm.detach().cpu())
-                write_weights_hist.append(write_w.detach().cpu())
-
         logits = torch.cat(logits_list, dim=1)
         recon = torch.cat(recon_list, dim=1)
         
-        # Return Adjacency matrices for Graph Regularization Loss
-        # We return the final state of adjacency for this batch
-        adj_tuple = (self.memory.stm_adjacency, self.memory.ltm_adjacency)
-
         if return_attn:
-            return logits, recon, \
-                   (torch.stack(read_weights_stm_hist, dim=1), torch.stack(read_weights_ltm_hist, dim=1)), \
-                   torch.stack(write_weights_hist, dim=1), adj_tuple
+            return logits, recon, None, None, None  # simplified for now
 
-        return logits, recon, adj_tuple
+        return logits, recon, None
