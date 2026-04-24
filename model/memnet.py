@@ -74,7 +74,7 @@ class MemNet(nn.Module):
 
             # Uncertainty-aware fusion
             conf = (conf_stm + conf_ltm) / 2
-            read_vec = read_vec + (conf.unsqueeze(1) * read_stm + (1 - conf.unsqueeze(1)) * read_ltm)
+            read_vec = conf.unsqueeze(1) * read_stm + (1 - conf.unsqueeze(1)) * read_ltm
 
             # 2. WRITE
             beta_w = F.softplus(self.controller.beta_write).clamp(1, 20)
