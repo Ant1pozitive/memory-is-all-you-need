@@ -78,11 +78,12 @@ class MemNet(nn.Module):
 
             # 2. WRITE
             beta_w = F.softplus(self.controller.beta_write).clamp(1, 20)
-            stm_mem, write_w = self.memory.write(
+            stm_mem, write_w, new_stm_age = self.memory.write(
                 stm_mem, self.memory.stm_adjacency, self.memory.stm_age,
                 self.memory.stm_prev_access_mean, write_key, write_val,
                 erase, add_gate, beta_w, self.memory.stm_decay_rate
             )
+            self.memory.stm_age = new_stm_age
 
             # Update Graphs
             self.memory.stm_adjacency, self.memory.stm_prev_access_mean = self.memory.update_hebbian_graph(
@@ -90,12 +91,12 @@ class MemNet(nn.Module):
             )
             self.memory.ltm_adjacency, self.memory.ltm_prev_access_mean = self.memory.update_hebbian_graph(
                 r_w_ltm, self.memory.ltm_adjacency, self.memory.ltm_prev_access_mean
-            )
+                )
 
             # 3. CONSOLIDATION / DREAMING
             if t > 0 and t % self.cfg.memory.synthesis_interval == 0:
                 stm_mem = self.memory.synthesize(stm_mem)
-                ltm_mem, self.memory.ltm_adjacency = self.memory.consolidate(
+                stm_mem, ltm_mem, self.memory.ltm_adjacency = self.memory.consolidate(
                     stm_mem, r_w_stm, ltm_mem, self.memory.ltm_adjacency
                 )
                 self.memory.stm_adjacency = self.memory.prune_weak_edges(self.memory.stm_adjacency)
