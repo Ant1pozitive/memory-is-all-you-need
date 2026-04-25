@@ -245,7 +245,7 @@ class MultiHeadMemoryBank(nn.Module):
     def write(self, memory: torch.Tensor, adjacency: torch.Tensor, age: torch.Tensor, prev_access_mean: torch.Tensor,
               write_keys: torch.Tensor, write_vals: torch.Tensor, erase: torch.Tensor, add_gate: torch.Tensor, beta: torch.Tensor, decay_rate: float) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            age += 1.0
+            new_age = age + 1.0
 
         compressed_vals = self.bottleneck(write_vals)
         
@@ -280,9 +280,9 @@ class MultiHeadMemoryBank(nn.Module):
 
         with torch.no_grad():
             accessed = (weights.mean(dim=1) > 0.01).float()
-            age = age * (1 - accessed)
+            new_age = new_age * (1 - accessed)
 
-        return new_memory, weights
+        return new_memory, weights, new_age
 
     def consolidate(self, stm_memory, stm_weights, ltm_memory, ltm_adjacency):
         """
@@ -290,16 +290,15 @@ class MultiHeadMemoryBank(nn.Module):
         High entropy = poor utilization -> do NOT transfer.
         """
         with torch.no_grad():
-            # Base utility: average over heads, then over batch -> (stm_slots,)
-            stm_util = stm_weights.mean(dim=1).mean(dim=0)  # (N_slots,)
+            # Base utility
+            stm_util = stm_weights.mean(dim=1).mean(dim=0)
 
-            # Entropy utilization
             if self.cfg.memory.use_entropy_utilization:
-                p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)  # (B, N_slots)
+                p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)
                 entropy = - (p * torch.log(p + 1e-8))  # (B, N_slots)
                 N = stm_weights.shape[-1]
                 entropy_factor = 1 - entropy.mean(dim=0) / torch.log(torch.tensor(N, device=stm_weights.device))
-                utilization = stm_util * entropy_factor  # (N_slots,)
+                utilization = stm_util * entropy_factor
             else:
                 utilization = stm_util
 
@@ -307,7 +306,7 @@ class MultiHeadMemoryBank(nn.Module):
             threshold = max(threshold, self.base_consolidation_threshold)
             candidate_mask = utilization > threshold
             if not candidate_mask.any():
-                return ltm_memory, ltm_adjacency
+                return stm_memory, ltm_memory, ltm_adjacency
 
             src_indices = torch.nonzero(candidate_mask).squeeze(1)
             if len(src_indices) > 16:
@@ -317,15 +316,18 @@ class MultiHeadMemoryBank(nn.Module):
             ltm_age_mean = self.ltm_age.mean(dim=0)
             _, dst_indices = torch.topk(ltm_age_mean, k=len(src_indices))
 
-            transferred_content = stm_memory[:, src_indices, :]
-            ltm_memory[:, dst_indices, :] = transferred_content
+            new_stm = stm_memory.clone()
+            new_ltm = ltm_memory.clone()
 
+            transferred_content = new_stm[:, src_indices, :]
+            new_ltm[:, dst_indices, :] = transferred_content
             noise = torch.randn_like(transferred_content) * 0.01
-            stm_memory[:, src_indices, :] = noise
+            new_stm[:, src_indices, :] = noise
+
             self.stm_age[:, src_indices] = 0
             self.ltm_age[:, dst_indices] = 0
 
-        return ltm_memory, ltm_adjacency
+        return new_stm, new_ltm, ltm_adjacency
 
     def prune_weak_edges(self, adjacency: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
