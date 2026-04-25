@@ -290,20 +290,21 @@ class MultiHeadMemoryBank(nn.Module):
         High entropy = poor utilization -> do NOT transfer.
         """
         with torch.no_grad():
-            # Base utility
-            stm_util = stm_weights.mean(dim=1).mean(dim=0)
-            
+            # Base utility: average over heads, then over batch -> (stm_slots,)
+            stm_util = stm_weights.mean(dim=1).mean(dim=0)  # (N_slots,)
+
             # Entropy utilization
             if self.cfg.memory.use_entropy_utilization:
-                p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)
-                entropy = - (p * torch.log(p + 1e-8)).sum(-1)
-                utilization = stm_util * (1 - entropy / torch.log(torch.tensor(stm_weights.shape[-1], device=stm_weights.device)))
+                p = stm_weights.mean(dim=1) / (stm_weights.mean(dim=1).sum(-1, keepdim=True) + 1e-8)  # (B, N_slots)
+                entropy = - (p * torch.log(p + 1e-8))  # (B, N_slots)
+                N = stm_weights.shape[-1]
+                entropy_factor = 1 - entropy.mean(dim=0) / torch.log(torch.tensor(N, device=stm_weights.device))
+                utilization = stm_util * entropy_factor  # (N_slots,)
             else:
                 utilization = stm_util
 
             threshold = torch.quantile(utilization, self.consolidation_percentile)
             threshold = max(threshold, self.base_consolidation_threshold)
-            
             candidate_mask = utilization > threshold
             if not candidate_mask.any():
                 return ltm_memory, ltm_adjacency
@@ -315,15 +316,15 @@ class MultiHeadMemoryBank(nn.Module):
 
             ltm_age_mean = self.ltm_age.mean(dim=0)
             _, dst_indices = torch.topk(ltm_age_mean, k=len(src_indices))
-            
+
             transferred_content = stm_memory[:, src_indices, :]
             ltm_memory[:, dst_indices, :] = transferred_content
-            
+
             noise = torch.randn_like(transferred_content) * 0.01
             stm_memory[:, src_indices, :] = noise
             self.stm_age[:, src_indices] = 0
             self.ltm_age[:, dst_indices] = 0
-            
+
         return ltm_memory, ltm_adjacency
 
     def prune_weak_edges(self, adjacency: torch.Tensor) -> torch.Tensor:
